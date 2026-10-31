@@ -1,0 +1,50 @@
+.board-card.topic {
+  background: #edf3ff;
+  border: 2px solid #7593c9;
+  box-shadow: 0 8px 24px #4163a317;
+}
+.topic-count {
+  display: block;
+  margin: 8px 0 12px;
+  color: #3b5e91;
+  font-size: 12px;
+  font-weight: 600;
+}
+.relation-editor {
+  border-block: 1px solid #e1e7f0;
+  margin: 16px 0;
+  padding: 12px 0 16px;
+}
+.relation-editor h3 {
+  font-size: 14px;
+  margin: 0 0 8px;
+}
+.relation-editor p {
+  font-size: 12px;
+  line-height: 1.6;
+}
+.relation-editor ul {
+  list-style: none;
+  padding: 0;
+  margin: 12px 0;
+}
+.relation-editor li {
+  margin: 8px 0;
+}
+.relation-editor li button {
+  text-align: left;
+  padding: 4px;
+  font-size: 12px;
+}
+.relation-editor li small {
+  color: #607391;
+}
+.topic-picker {
+  display: flex;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+.topic-picker select {
+  min-width: 0;
+  flex: 1;
+}

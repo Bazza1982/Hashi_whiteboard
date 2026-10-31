@@ -1,0 +1,40 @@
+{
+  "name": "hashi-whiteboard",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "A local, LAN-shared temporary team whiteboard for humans and agents.",
+  "license": "UNLICENSED",
+  "engines": {
+    "node": ">=24"
+  },
+  "scripts": {
+    "dev": "vite --host 127.0.0.1",
+    "build": "vite build",
+    "start": "node server/index.mjs",
+    "host": "node server/host.mjs",
+    "service:install": "powershell.exe -NoProfile -NonInteractive -File scripts/service.ps1 -Action Install",
+    "service:start": "powershell.exe -NoProfile -NonInteractive -File scripts/service.ps1 -Action Start",
+    "service:stop": "powershell.exe -NoProfile -NonInteractive -File scripts/service.ps1 -Action Stop",
+    "service:restart": "powershell.exe -NoProfile -NonInteractive -File scripts/service.ps1 -Action Restart",
+    "service:status": "powershell.exe -NoProfile -NonInteractive -File scripts/service.ps1 -Action Status",
+    "access": "node agent/access.mjs",
+    "agent": "node agent/cli.mjs",
+    "mcp": "node agent/mcp.mjs",
+    "test": "node --test tests/server.test.mjs tests/organization.test.mjs tests/mcp.test.mjs tests/startup.test.mjs tests/host.test.mjs",
+    "test:browser": "node tests/browser.mjs && node tests/lan-browser.mjs && node tests/organization-browser.mjs",
+    "format": "prettier --write src server shared agent tests docs README.md AGENTS.md THIRD_PARTY_NOTICES.md package.json vite.config.js index.html"
+  },
+  "dependencies": {
+    "@xyflow/react": "12.12.0",
+    "express": "4.22.3",
+    "react": "18.3.1",
+    "react-dom": "18.3.1"
+  },
+  "devDependencies": {
+    "@playwright/test": "1.61.1",
+    "@vitejs/plugin-react": "6.1.2",
+    "prettier": "^3.9.10",
+    "vite": "8.3.5"
+  }
+}

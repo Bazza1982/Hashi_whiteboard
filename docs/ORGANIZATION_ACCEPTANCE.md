@@ -1,0 +1,10 @@
+# Topic linking and automatic arrangement — 2026-10-30
+
+- Reused the private Workbench Canvas deterministic layout planner through a project/topic adapter; no Workbench runtime or HASHI production changes.
+- New work requires one topic in the same exact project, created atomically with its membership. Repeated progress updates continue to use the same immutable work card. HTTP, CLI and MCP expose the same rules.
+- Service checks reject duplicate/self links, topic nesting, multiple parents, cross-project membership, cyclic/redundant dependencies, more than three direct prerequisites, extra related links between siblings and more than one related link per endpoint. Topic moves remove newly redundant related lines in the same transaction after checking applicable ownership.
+- Arrangement changes positions only and commits atomically. Undo survives a store restart, preserves newer content, and fails without partial writes after an intervening position/structural change. The latest 20 arrangements are retained.
+- 18 service/protocol/startup/recovery tests passed. Three isolated headless browser suites passed, including real topic/work creation, sparse edge display, arrange/reload/undo buttons, topic moves, measured non-overlap, LAN collaborative editing and conflict draft preservation.
+- Live release: backed up the original board; assigned all 14 existing work cards to 8 concrete topics; added four prerequisite links supported by the existing reports. Original work content, revisions and status were unchanged during classification. Own layout maintenance card was then updated with a signed completion report.
+- A real native Windows service restart retained exact work, topics, typed edges and positions. A read-only headless check found zero overlaps or page errors; 20 health requests succeeded. This is a host-side LAN-address check, not a second physical device test. The host PC was not rebooted.
+- Screenshots, the pre-release snapshot, operation receipts and verification output remain in ignored local artifacts. Agent-facing instructions are served at `/AGENT_INSTRUCTIONS.md` and `/api/guide`.
