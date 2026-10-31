@@ -182,13 +182,13 @@ frontend build is served by the Node server; there is no separate backend
 installation. See [verification scope](docs/ACCEPTANCE.md) and
 [source publication rules](docs/SOURCE_PUBLICATION.md).
 
-## Copyright and provenance
+## License and provenance
 
-This repository is public for source inspection. **It is not licensed as an
-open-source project**: the existing [all-rights-reserved licence](LICENSE)
-does not grant a general right to reuse or redistribute the product code.
-Contact the copyright owner for permission.
+HASHI Whiteboard is **MIT licensed**. You may use, modify, redistribute and
+use it commercially under the terms of the [MIT License](LICENSE), including
+retaining its copyright and permission notice.
 
-Third-party components retain their own licences. Workbench-derived canvas
-code retains its provenance and is not relicensed as MIT by its inclusion here.
+Third-party dependencies retain their own licences and notices.
+Workbench-derived code included in this repository is part of this MIT release;
+other Workbench code outside this repository is not covered by this grant.
 See [third-party notices](THIRD_PARTY_NOTICES.md).

@@ -1,4 +1,6 @@
-HASHI Whiteboard — bundled UI third-party notices
+HASHI Whiteboard — MIT licensed; bundled UI third-party notices
+
+The product is licensed under MIT; see the repository LICENSE.
 
 React Flow (@xyflow/react)
 Copyright (c) 2019-2025 webkid GmbH

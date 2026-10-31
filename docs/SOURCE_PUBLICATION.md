@@ -1,8 +1,8 @@
 # Source publication boundary
 
 Publish application source, synthetic tests, dependency manifests, generic
-documentation and licence/provenance notices only. Public visibility does not
-change the existing all-rights-reserved product licence.
+documentation and licence/provenance notices only. The code published in this
+repository is MIT licensed; retain the MIT licence and third-party notices.
 
 Never commit live board projects, cards, comments, identities, SQLite files,
 images, exports, backups, logs, credentials, local settings or deployment
