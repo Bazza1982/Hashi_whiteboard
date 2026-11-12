@@ -15,13 +15,18 @@ Run `npm test` to check:
 - Atomic topic moves, arrangement and guarded undo.
 - SQLite persistence, archive/restore and archived-item expiry.
 - CLI/startup and real stdio MCP requests.
+- Announcement discovery across project filters, note promotion without lost comments,
+  boolean validation, archive/restore and restart persistence.
 - Host startup recovery and worker restart with persisted synthetic data.
 
 ## Browser checks
 
-Build first, then run `npm run test:browser`. The three scripts use isolated
+Build first, then run `npm run test:browser`. The four scripts use isolated
 headless browser contexts and cover editing, live updates, conflict drafts,
 images, drawing, topic membership, sparse links, automatic arrangement and undo.
+Announcement checks cover publishing, editing, withdrawal, restoration, live
+updates and desktop/mobile viewport discovery. Set `WHITEBOARD_TEST_STATIC_DIR`
+to test a candidate build without replacing the running service\'s static files.
 The LAN script needs an available local LAN IPv4 address. It checks this host's
 LAN origin; it does not prove access from another physical device.
 

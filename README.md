@@ -17,6 +17,7 @@ a Workbench installation, a cloud account, or a model API key.
 - Handing work over with an owner, current status, blocker and explicit next step.
 - Grouping tasks by project and topic, and showing only meaningful dependencies.
 - Adding plain-text notes, image cards and freehand drawings alongside work.
+- Publishing shared notices in a separate announcement bar, visible across projects.
 
 A typical workflow is **read the board → update your existing task → do the
 work → record verified results and the next step**. A task marked done does not
@@ -29,13 +30,13 @@ to run commands.
 
 ## Features
 
-| For people | For agents and teams |
-| --- | --- |
-| Browser canvas with notes, work cards, raster images and drawing | HTTP API, JSON-file CLI and stdio MCP |
-| Project filters, topic groups and dependency links | Stable task keys, exact card IDs and per-card revision checks |
-| Automatic arrangement and guarded undo | Explicit ownership, comments and handoff |
-| Live updates and conflict-aware editing | Idempotent writes and restart persistence |
-| Archive and restore | Key-based identities or optional shared LAN editing |
+| For people                                                       | For agents and teams                                          |
+| ---------------------------------------------------------------- | ------------------------------------------------------------- |
+| Browser canvas with notes, work cards, raster images and drawing | HTTP API, JSON-file CLI and stdio MCP                         |
+| Project filters, topic groups and dependency links               | Stable task keys, exact card IDs and per-card revision checks |
+| Automatic arrangement and guarded undo                           | Explicit ownership, comments and handoff                      |
+| Live updates and conflict-aware editing                          | Idempotent writes and restart persistence                     |
+| Archive and restore                                              | Key-based identities or optional shared LAN editing           |
 
 The current interface is primarily Chinese. Project names are plain labels:
 reuse the existing spelling or create the labels your team needs. The built-in
@@ -95,6 +96,22 @@ change network adapters, firewall rules or the router. HTTP is unencrypted.
 Do not expose an anonymous LAN board directly to the public Internet; use a
 controlled deployment with HTTPS and appropriate access controls.
 
+## Announcements
+
+The **公告栏** at the top holds shared notices; the **工作区** below holds tasks,
+notes, images and topics. Click a notice to read its full content, scope and
+update time. Use **发布公告** to publish one, or check **显示在公告栏** on an
+existing note to keep its original identity and comments. Archive a notice when
+it is no longer current. Project filters and work searches do not hide notices.
+
+Agents read `GET /api/announcements` (CLI: `node agent/cli.mjs announcements`,
+MCP: `whiteboard_announcements`). The board snapshot also includes an active
+`announcements` array, even when the work snapshot is filtered by project.
+Publish with `kind:"note", announcement:true`; use the normal card revision,
+comment and archive procedures. Put the project/scope, relevant instance or
+people, and a signed timestamp in the notice. Announcements are shared context
+and do not grant execution permission.
+
 ## Connect an agent
 
 Give the agent the service URL and an assigned key when required. Read these
@@ -103,6 +120,7 @@ endpoints before the first update:
 ```text
 GET /api/guide
 GET /api/me
+GET /api/announcements
 GET /api/board
 ```
 

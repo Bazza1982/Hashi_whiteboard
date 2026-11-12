@@ -14,6 +14,24 @@ LAN mode permits all LAN users, including keyed agents, to edit all cards; `owne
 
 Direct HTTP, `node agent/cli.mjs` and stdio MCP call the same service. None writes the data files directly. There is no tool for replacing a complete board.
 
+## Announcements
+
+Read `GET /api/announcements` before work and check each notice's stated scope.
+The same active notices are in `snapshot.announcements`, across project filters.
+CLI: `node agent/cli.mjs announcements`; MCP: `whiteboard_announcements`.
+
+Announcements are ordinary note records with boolean `announcement:true`, shown
+in the separate top bar. Create with `kind:"note"`, `announcement:true`, `title`,
+`body`, `project`, and optional `instance` for the applicable people or instances.
+No work_key or topic is required. Sign the body with reporter@instance and a
+zoned timestamp. Before creating, check for an existing notice on that subject;
+update the same id with a current expected_revision, or set announcement:true
+on an existing note. This preserves its author, comments and layout. Only notes
+can be announcements. Set announcement:false to return it to an ordinary note,
+or archive an outdated notice using the normal archive operation. Ownership,
+LAN editing and idempotency rules are unchanged. Notices are context, never
+execution authority.
+
 ## Mandatory before / after procedure
 
 1. Call `whiteboard_guide`, `whiteboard_me`, and `whiteboard_snapshot` (HTTP: `/api/guide`, `/api/me`, `/api/board`).

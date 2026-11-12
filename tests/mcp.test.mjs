@@ -70,6 +70,29 @@ test("actual stdio MCP client discovers and uses the shared authenticated board"
       .code,
     "invalid_arguments",
   );
+  const announcement = await tool("whiteboard_create_card", {
+    operation_id: randomUUID(),
+    kind: "note",
+    announcement: true,
+    title: "Shared notice",
+    body: "Read before work.",
+    project: "Operations",
+  });
+  assert.ok(!announcement.error);
+  const notices = await tool("whiteboard_announcements");
+  assert.equal(notices.data.announcements[0].id, announcement.data.card.id);
+  assert.equal(
+    (
+      await tool("whiteboard_create_card", {
+        operation_id: randomUUID(),
+        kind: "note",
+        announcement: "true",
+        title: "Invalid flag",
+        project: "Operations",
+      })
+    ).data.error.code,
+    "invalid_arguments",
+  );
   const created = await tool("whiteboard_create_card", {
     operation_id: randomUUID(),
     kind: "work",

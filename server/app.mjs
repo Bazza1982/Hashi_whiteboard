@@ -71,11 +71,20 @@ export function createApp({
       req.get("sec-fetch-dest") === "document" &&
       !req.path.startsWith("/api");
     const origin = req.get("origin");
-    if (
-      !publicNavigation &&
-      origin &&
-      origin !== `${req.protocol}://${req.get("host")}`
-    )
+    let originMatchesHost = !origin;
+    if (origin) {
+      try {
+        // A TLS-terminating reverse proxy preserves Host while Express sees the
+        // connector's HTTP hop. Compare authorities so same-origin module and
+        // stylesheet requests keep working without trusting forwarded headers.
+        originMatchesHost =
+          new URL(origin).host.toLowerCase() ===
+          String(req.get("host") || "").toLowerCase();
+      } catch {
+        originMatchesHost = false;
+      }
+    }
+    if (!publicNavigation && origin && !originMatchesHost)
       return res.status(403).json({
         error: {
           code: "origin_denied",
@@ -186,6 +195,9 @@ export function createApp({
       lan_urls: lan.map((a) => `http://${a}:${port}`),
     });
   });
+  app.get("/api/announcements", (_req, res) =>
+    res.json({ announcements: store.announcements() }),
+  );
   app.get("/api/board", (req, res) =>
     res.json(
       store.snapshot({

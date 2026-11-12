@@ -14,7 +14,14 @@ export async function fixture({
   mkdirSync(path.join(root, "artifacts"), { recursive: true });
   const dataDir =
     directory || mkdtempSync(path.join(root, "artifacts", "test-"));
-  const service = createApp({ dataDir, adminKey: ADMIN, ...options });
+  const service = createApp({
+    dataDir,
+    adminKey: ADMIN,
+    ...(process.env.WHITEBOARD_TEST_STATIC_DIR
+      ? { staticDir: process.env.WHITEBOARD_TEST_STATIC_DIR }
+      : {}),
+    ...options,
+  });
   const server = service.app.listen(0, host);
   await new Promise((resolve, reject) => {
     server.once("listening", resolve);

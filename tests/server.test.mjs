@@ -197,6 +197,30 @@ test("external links can open the UI without allowing cross-site API calls or fr
     403,
   );
   assert.equal((await navigate("/", { "sec-fetch-mode": "cors" })).status, 403);
+  assert.equal(
+    (
+      await navigate("/", {
+        Host: "whiteboard.example",
+        Origin: "https://whiteboard.example",
+        "sec-fetch-site": "same-origin",
+        "sec-fetch-mode": "cors",
+        "sec-fetch-dest": "script",
+      })
+    ).status,
+    200,
+  );
+  assert.equal(
+    (
+      await navigate("/", {
+        Host: "whiteboard.example",
+        Origin: "https://whiteboard.example:444",
+        "sec-fetch-site": "same-origin",
+        "sec-fetch-mode": "cors",
+        "sec-fetch-dest": "script",
+      })
+    ).status,
+    403,
+  );
 });
 
 test("identity, immutable work identity, ownership, explicit handoff and append-only comments", async (t) => {

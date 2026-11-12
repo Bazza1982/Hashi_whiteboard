@@ -52,7 +52,10 @@ const blank = {
   pr_url: "",
   merge_status: "not_applicable",
   asset_id: "",
+  announcement: false,
 };
+const fieldValue = (card, key) =>
+  card[key] ?? (key === "announcement" ? false : "");
 const messages = {
   unauthorized: "访问已过期，请重新登录。",
   owner_mismatch: "这张卡片属于其他 Agent。您可以留言，或请负责人交接。",
@@ -312,6 +315,7 @@ function Board({ actor, access, onSignIn, onLogout }) {
   const shown = board.cards
     .filter(
       (c) =>
+        !c.announcement &&
         (archived || !c.archived_at) &&
         (!project || c.project === project) &&
         (!query ||
@@ -576,6 +580,9 @@ function Board({ actor, access, onSignIn, onLogout }) {
         }),
       ).catch(() => {});
   };
+  const announcements = board.cards
+    .filter((c) => c.announcement && (archived || !c.archived_at))
+    .sort((a, b) => b.updated_at.localeCompare(a.updated_at));
   const stats = board.cards.filter((c) => !c.archived_at && c.kind === "work");
   return (
     <div className="app-shell">
@@ -612,11 +619,47 @@ function Board({ actor, access, onSignIn, onLogout }) {
               : "退出"}
         </button>
       </header>
+      <section className="announcements-bar" aria-label="公告栏">
+        <div className="announcements-heading">
+          <h2>
+            公告栏 <small>{announcements.length}</small>
+          </h2>
+          <button onClick={() => addCard("announcement")}>＋ 发布公告</button>
+        </div>
+        {announcements.length ? (
+          <div className="announcement-list">
+            {announcements.map((c) => (
+              <button
+                key={c.id}
+                className={`announcement-entry ${selected === c.id ? "active" : ""}`}
+                aria-label={`查看公告：${c.title}`}
+                onClick={() => selectCard(c.id)}
+              >
+                <strong>
+                  {c.archived_at ? "已撤下 · " : ""}
+                  {c.title}
+                </strong>
+                <span>
+                  {c.project}
+                  {c.instance ? ` · ${c.instance}` : ""}
+                </span>
+                <time dateTime={c.updated_at}>
+                  更新于 {new Date(c.updated_at).toLocaleString("zh-CN")}
+                </time>
+              </button>
+            ))}
+          </div>
+        ) : (
+          <p className="announcements-empty">
+            暂无公告。公共提醒与共用信息放这里。
+          </p>
+        )}
+      </section>
       <div className="workspace">
         <aside className="board-sidebar">
           <div className="sidebar-heading">
             <span className="eyebrow">TEAM SPACE</span>
-            <h2>进行中的事</h2>
+            <h2>工作区</h2>
           </div>
           <div className="summary">
             <span>
@@ -817,21 +860,22 @@ function Board({ actor, access, onSignIn, onLogout }) {
               }}
             />
           )}
-          {loaded && !board.cards.some((c) => !c.archived_at) && (
-            <div className="empty-state">
-              <span className="empty-orbit">✳</span>
-              <p className="eyebrow">MAKE ROOM FOR THE WORK</p>
-              <h1>从一张便签开始。</h1>
-              <p>
-                想法、进展、线索与下一步。
-                <br />
-                让每位 Agent 都能接上同一段工作。
-              </p>
-              <button className="primary" onClick={() => addCard("topic")}>
-                ＋ 添加第一个主题
-              </button>
-            </div>
-          )}
+          {loaded &&
+            !board.cards.some((c) => !c.archived_at && !c.announcement) && (
+              <div className="empty-state">
+                <span className="empty-orbit">✳</span>
+                <p className="eyebrow">MAKE ROOM FOR THE WORK</p>
+                <h1>从一张便签开始。</h1>
+                <p>
+                  想法、进展、线索与下一步。
+                  <br />
+                  让每位 Agent 都能接上同一段工作。
+                </p>
+                <button className="primary" onClick={() => addCard("topic")}>
+                  ＋ 添加第一个主题
+                </button>
+              </div>
+            )}
           <div className="canvas-hint">
             虚线表示主题归属 · 箭头表示前置 → 后续 · 选卡查看额外连接
           </div>
@@ -932,7 +976,7 @@ function Board({ actor, access, onSignIn, onLogout }) {
           />
         </Modal>
       )}
-      {["work", "note", "topic"].includes(dialog) && (
+      {["work", "note", "topic", "announcement"].includes(dialog) && (
         <CreateDialog
           kind={dialog}
           project={project}
@@ -965,6 +1009,10 @@ function Board({ actor, access, onSignIn, onLogout }) {
             {sharedEdit
               ? "这是临时团队现场。局域网用户无需密钥即可读写所有卡片；负责人代表工作分工，不限制编辑。"
               : "这是临时团队现场。所有成员能读取；Agent 更新自己的卡片，主人可以更新全部。"}
+          </p>
+          <p>
+            <b>公告栏：</b>
+            页面上方查看公共提醒，点击标题读全文；用“发布公告”添加，过期后归档撤下。公告不计入任务状态，项目筛选不会隐藏公告。
           </p>
           <ol>
             <li>
@@ -1094,8 +1142,12 @@ function Modal({ title, onClose, children }) {
 function CreateDialog({ kind, project, topics, onClose, onCreate }) {
   const [form, setForm] = useState({
       ...blank,
-      kind,
-      project: project || topics[0]?.project || "general",
+      kind: kind === "announcement" ? "note" : kind,
+      announcement: kind === "announcement",
+      project:
+        project ||
+        (kind === "announcement" ? "general" : topics[0]?.project) ||
+        "general",
       topic_id: "",
     }),
     [error, setError] = useState(""),
@@ -1105,11 +1157,13 @@ function CreateDialog({ kind, project, topics, onClose, onCreate }) {
   return (
     <Modal
       title={
-        kind === "topic"
-          ? "添加主题"
-          : kind === "work"
-            ? "添加工作"
-            : "添加便签"
+        kind === "announcement"
+          ? "发布公告"
+          : kind === "topic"
+            ? "添加主题"
+            : kind === "work"
+              ? "添加工作"
+              : "添加便签"
       }
       onClose={onClose}
     >
@@ -1143,7 +1197,15 @@ function CreateDialog({ kind, project, topics, onClose, onCreate }) {
           }
           required
         />
-        {kind !== "topic" && (
+        {kind === "announcement" && (
+          <Field
+            label="适用实例 / 对象"
+            value={form.instance}
+            onChange={change("instance")}
+            placeholder="例如 全体成员，或某个实例的 Agents"
+          />
+        )}
+        {kind !== "topic" && kind !== "announcement" && (
           <Field label="所属主题">
             <select
               required={kind === "work"}
@@ -1198,7 +1260,11 @@ function CreateDialog({ kind, project, topics, onClose, onCreate }) {
           </p>
         )}
         <button className="primary" disabled={saving} type="submit">
-          {saving ? "正在添加…" : "添加到白板"}
+          {saving
+            ? "正在添加…"
+            : kind === "announcement"
+              ? "发布到公告栏"
+              : "添加到白板"}
         </button>
       </form>
     </Modal>
@@ -1226,7 +1292,9 @@ function Inspector({
   const read = useCallback(async () => {
     const { card } = await api(`/api/cards/${id}`);
     setBase(card);
-    setForm(Object.fromEntries(CARD_FIELDS.map((k) => [k, card[k] || ""])));
+    setForm(
+      Object.fromEntries(CARD_FIELDS.map((k) => [k, fieldValue(card, k)])),
+    );
   }, [id]);
   useEffect(() => {
     read().catch((e) => setError(e.message));
@@ -1240,7 +1308,7 @@ function Inspector({
       .catch(() => {});
   }, [latest.comment_count, id, base?.comments?.length]);
   const dirty = Boolean(
-    base && form && CARD_FIELDS.some((k) => form[k] !== (base[k] || "")),
+    base && form && CARD_FIELDS.some((k) => form[k] !== fieldValue(base, k)),
   );
   useEffect(() => {
     const guard = () =>
@@ -1278,7 +1346,9 @@ function Inspector({
       if (result.card) {
         const card = { ...result.card, comments: base.comments };
         setBase(card);
-        setForm(Object.fromEntries(CARD_FIELDS.map((k) => [k, card[k] || ""])));
+        setForm(
+          Object.fromEntries(CARD_FIELDS.map((k) => [k, fieldValue(card, k)])),
+        );
       }
       return result;
     } catch (e) {
@@ -1292,9 +1362,13 @@ function Inspector({
       <header>
         <div>
           <span className="eyebrow">
-            {base.kind === "work" ? "WORK CARD" : "NOTE DETAILS"}
+            {base.announcement
+              ? "ANNOUNCEMENT"
+              : base.kind === "work"
+                ? "WORK CARD"
+                : "NOTE DETAILS"}
           </span>
-          <h2>卡片详情</h2>
+          <h2>{base.announcement ? "公告详情" : "卡片详情"}</h2>
         </div>
         <button aria-label="关闭详情" onClick={onClose}>
           ×
@@ -1310,15 +1384,17 @@ function Inspector({
           {actors.find((a) => a.id === base.owner_id)?.name || base.owner_id} ·
           版本 {base.revision}
         </small>
-        <RelationEditor
-          card={base}
-          board={board}
-          canWrite={canWrite}
-          onSelect={onSelect}
-          mutate={(url, body) =>
-            act(() => api(url, { method: "POST", body })).catch(() => {})
-          }
-        />
+        {!base.announcement && (
+          <RelationEditor
+            card={base}
+            board={board}
+            canWrite={canWrite}
+            onSelect={onSelect}
+            mutate={(url, body) =>
+              act(() => api(url, { method: "POST", body })).catch(() => {})
+            }
+          />
+        )}
         {conflict && (
           <div className="conflict">
             <b>有更新，当前草稿已保留。</b>
@@ -1345,7 +1421,7 @@ function Inspector({
           onSubmit={(e) => {
             e.preventDefault();
             const changes = Object.fromEntries(
-              CARD_FIELDS.filter((k) => form[k] !== (base[k] || "")).map(
+              CARD_FIELDS.filter((k) => form[k] !== fieldValue(base, k)).map(
                 (k) => [k, form[k]],
               ),
             );
@@ -1374,6 +1450,25 @@ function Inspector({
               onChange={change("project")}
               required
             />
+            {base.kind === "note" && (
+              <label className="check">
+                <input
+                  type="checkbox"
+                  checked={form.announcement}
+                  onChange={(e) =>
+                    setForm((f) => ({ ...f, announcement: e.target.checked }))
+                  }
+                />
+                显示在公告栏
+              </label>
+            )}
+            {form.announcement && (
+              <Field
+                label="适用实例 / 对象"
+                value={form.instance}
+                onChange={change("instance")}
+              />
+            )}
             {base.kind === "work" && (
               <Field label="工作状态">
                 <select value={form.status} onChange={change("status")}>
@@ -1573,7 +1668,13 @@ function Inspector({
                 );
             }}
           >
-            {base.archived_at ? "恢复卡片" : "归档这张卡片"}
+            {base.announcement
+              ? base.archived_at
+                ? "恢复公告"
+                : "撤下公告"
+              : base.archived_at
+                ? "恢复卡片"
+                : "归档这张卡片"}
           </button>
         )}
         {error && (

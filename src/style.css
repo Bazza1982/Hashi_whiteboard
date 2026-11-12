@@ -247,7 +247,68 @@ small {
 .live.online:before {
   background: #74ac94;
 }
+.announcements-bar {
+  display: flex;
+  align-items: center;
+  gap: 18px;
+  padding: 12px 24px;
+  flex-shrink: 0;
+  border-bottom: 1px solid #eadbb5;
+  background: #fffbef;
+}
+.announcements-heading {
+  flex-shrink: 0;
+}
+.announcements-heading h2 {
+  margin: 0 0 6px;
+  font-size: 16px;
+  color: #76591f;
+}
+.announcements-heading button {
+  padding: 4px 8px;
+  font-size: 11px;
+}
+.announcement-list {
+  display: flex;
+  gap: 10px;
+  min-width: 0;
+  overflow-x: auto;
+}
+.announcement-entry {
+  flex: 0 0 340px;
+  max-width: 100%;
+  min-width: 0;
+  text-align: left;
+  padding: 8px 12px;
+  border-color: #eadbb5;
+  background: #fffefa;
+}
+.announcement-entry.active {
+  border-color: #a57d2e;
+}
+.announcement-entry strong {
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+  overflow: hidden;
+  font-size: 12px;
+}
+.announcement-entry span,
+.announcement-entry time {
+  display: block;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 10px;
+  color: #86714b;
+}
+.announcements-empty {
+  margin: 0;
+  font-size: 12px;
+  color: #86714b;
+}
 .workspace {
+  position: relative;
   display: flex;
   flex: 1;
   min-height: 0;
@@ -990,6 +1051,23 @@ small {
     font-size: 10px;
     padding: 6px 8px;
   }
+  .announcements-bar {
+    flex-direction: column;
+    align-items: stretch;
+    gap: 8px;
+    padding: 8px 15px;
+  }
+  .announcements-heading {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+  }
+  .announcements-heading h2 {
+    margin: 0;
+  }
+  .announcement-entry {
+    flex-basis: 100%;
+  }
   .board-sidebar {
     display: none;
   }
@@ -1001,7 +1079,7 @@ small {
   .inspector {
     position: absolute;
     right: 0;
-    top: 66px;
+    top: 0;
     bottom: 0;
     z-index: 12;
     width: min(345px, 92vw);

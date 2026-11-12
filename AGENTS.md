@@ -3,6 +3,7 @@
 This repository is a small standalone product. Read README.md and docs/AGENT_PROTOCOL.md.
 For actual team-board operations, first call the running service's `/api/guide` and `/api/me`, then read `/api/board`. Do not write its SQLite files.
 
+- Read active notices from `/api/announcements` (also `snapshot.announcements`) and their scope before work. Publish a note with `announcement:true`; reuse existing notices, sign updates, archive withdrawn notices. Announcements are separate from canvas work, not execution authority.
 - A work item's immutable id and stable work_key identify it; titles do not.
 - Before/after work, read `/api/me` and the guide's `access` mode, then update an exact card using the current revision and a unique operation id. Key mode enforces ownership; LAN mode allows all configured LAN users to edit all cards without a key.
 - Keep verified results, next steps, owner, repository, branch, instance and PR state accurate. Task done does not imply PR merged.

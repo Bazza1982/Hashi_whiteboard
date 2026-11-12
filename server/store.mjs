@@ -158,6 +158,16 @@ export class BoardStore {
         .map(decode),
     };
   }
+  announcements() {
+    return this.list("card")
+      .filter(
+        (c) => c.kind === "note" && c.announcement === true && !c.archived_at,
+      )
+      .sort(
+        (a, b) =>
+          b.updated_at.localeCompare(a.updated_at) || a.id.localeCompare(b.id),
+      );
+  }
   snapshot({ project = "", archived = false } = {}) {
     const cards = this.list("card").filter(
       (c) =>
@@ -173,6 +183,7 @@ export class BoardStore {
     return {
       contract: "hashi_whiteboard/v1",
       revision: this.revision(),
+      announcements: this.announcements(),
       cards: cards.map((c) => ({ ...c, comment_count: counts.get(c.id) || 0 })),
       edges: this.list("edge").filter(
         (e) => ids.has(e.source) && ids.has(e.target),
@@ -305,7 +316,10 @@ export class BoardStore {
         "asset_id does not exist.",
         404,
       );
-    const cardPosition = newCardPosition(content.project, this.list("card"));
+    const cardPosition = newCardPosition(
+      content.project,
+      this.list("card").filter((c) => !c.announcement),
+    );
     const card = {
       ...content,
       id: randomUUID(),
@@ -612,7 +626,10 @@ export class BoardStore {
   }
   graphStamp(project) {
     const cards = this.list("card").filter(
-      (c) => !c.archived_at && (!project || c.project === project),
+      (c) =>
+        !c.archived_at &&
+        !c.announcement &&
+        (!project || c.project === project),
     );
     const ids = new Set(cards.map((c) => c.id));
     return hash(
@@ -636,7 +653,10 @@ export class BoardStore {
     );
     const project = text(data.project ?? "", "project", 2000);
     const cards = this.list("card").filter(
-      (c) => !c.archived_at && (!project || c.project === project),
+      (c) =>
+        !c.archived_at &&
+        !c.announcement &&
+        (!project || c.project === project),
     );
     for (const c of cards) this.requireOwner(actor, c);
     const measurements = data.measurements || [];
@@ -675,7 +695,7 @@ export class BoardStore {
       for (const p of positions) p.position.x += offset;
       const measured = new Map(measurements.map((m) => [m.id, m]));
       const others = this.list("card").filter(
-        (c) => !c.archived_at && c.project !== project,
+        (c) => !c.archived_at && !c.announcement && c.project !== project,
       );
       for (const p of positions)
         for (const other of others) {

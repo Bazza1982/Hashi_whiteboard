@@ -21,8 +21,8 @@
     "access": "node agent/access.mjs",
     "agent": "node agent/cli.mjs",
     "mcp": "node agent/mcp.mjs",
-    "test": "node --test tests/server.test.mjs tests/organization.test.mjs tests/mcp.test.mjs tests/startup.test.mjs tests/host.test.mjs",
-    "test:browser": "node tests/browser.mjs && node tests/lan-browser.mjs && node tests/organization-browser.mjs",
+    "test": "node --test tests/server.test.mjs tests/organization.test.mjs tests/mcp.test.mjs tests/startup.test.mjs tests/host.test.mjs tests/announcements.test.mjs",
+    "test:browser": "node tests/browser.mjs && node tests/lan-browser.mjs && node tests/organization-browser.mjs && node tests/announcements-browser.mjs",
     "format": "prettier --write src server shared agent tests docs README.md AGENTS.md THIRD_PARTY_NOTICES.md package.json vite.config.js index.html"
   },
   "dependencies": {

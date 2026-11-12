@@ -6,6 +6,7 @@ const routes = {
   guide: ["GET", "/api/guide"],
   me: ["GET", "/api/me"],
   snapshot: ["GET", "/api/board"],
+  announcements: ["GET", "/api/announcements"],
   get: ["GET", `/api/cards/${encodeURIComponent(idOrFile || "")}`],
   create: ["POST", "/api/cards"],
   connect: ["POST", "/api/edges"],
@@ -22,7 +23,7 @@ const routes = {
 try {
   if (!routes[command])
     throw new Error(
-      "Commands: guide | me | snapshot | get CARD_ID | create/connect JSON_FILE | topic/update/comment/handoff/archive CARD_ID JSON_FILE | register JSON_FILE",
+      "Commands: guide | me | announcements | snapshot | get CARD_ID | create/connect JSON_FILE | topic/update/comment/handoff/archive CARD_ID JSON_FILE | register JSON_FILE",
     );
   const [method, endpoint] = routes[command];
   const data =

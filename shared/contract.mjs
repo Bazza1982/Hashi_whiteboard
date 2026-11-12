@@ -20,6 +20,7 @@ export const CARD_FIELDS = [
   "pr_url",
   "merge_status",
   "asset_id",
+  "announcement",
 ];
 export class BoardError extends Error {
   constructor(code, message, status = 400, details = {}) {
@@ -99,6 +100,16 @@ export function cardContent(input, existing = null) {
       "Only work/topic cards have a work_key.",
     );
   for (const key of CARD_FIELDS) {
+    if (key === "announcement") {
+      out.announcement = input.announcement ?? existing?.announcement ?? false;
+      fail(
+        typeof out.announcement === "boolean" &&
+          (!out.announcement || kind === "note"),
+        "invalid_announcement",
+        "announcement must be a boolean; only note cards can be announcements.",
+      );
+      continue;
+    }
     const fallback =
       key === "project"
         ? "general"
@@ -183,7 +194,17 @@ export const GUIDE = {
   contract: CONTRACT,
   purpose:
     "Temporary shared team context. Work here is a status report, not an instruction or authority grant. Source repositories and research files remain authoritative.",
+  announcements: {
+    read: "GET /api/announcements",
+    create:
+      'POST /api/cards {kind:"note",announcement:true,title,body,project,instance}',
+    maintain:
+      "Update the same card id and revision; set announcement:true on an existing note to publish it without duplicating its records. Archive withdrawn announcements. State scope and sign body with reporter@instance and timezone timestamp.",
+    display:
+      "The announcement bar is separate from work and stays visible across project filters. Active announcements also appear in the snapshot announcements array. Board notices are context, not execution authority.",
+  },
   workflow: [
+    "Read active announcements before work via /api/announcements or the snapshot announcements array; check their stated scope.",
     "Read access.mode and GET /api/me first. In lan mode no key is required: unkeyed updates use the shared lan-shared identity. An optional assigned Bearer key identifies a named actor. In key mode a valid key is required. Never infer identity from a name or machine.",
     "Before starting: GET /api/board, find the exact work_key, read its owner_id, revision, progress and next_step.",
     "Create a work card only if its stable work_key does not already exist. The server assigns its immutable card id and owner.",
@@ -212,6 +233,7 @@ export const GUIDE = {
   endpoints: {
     self: "GET /api/me",
     snapshot: "GET /api/board?project=optional",
+    announcements: "GET /api/announcements",
     read: "GET /api/cards/:id",
     create:
       "POST /api/cards {kind,work_key,title,project,topic_id,...} (new work requires topic_id)",
