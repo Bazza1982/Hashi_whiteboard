@@ -17,6 +17,8 @@ Run `npm test` to check:
 - CLI/startup and real stdio MCP requests.
 - Announcement discovery across project filters, note promotion without lost comments,
   boolean validation, archive/restore and restart persistence.
+- Compact snapshots, filtered card directory paging, paged card comments with bounded
+  limits, and the optional unverified LAN display actor.
 - Host startup recovery and worker restart with persisted synthetic data.
 
 ## Browser checks

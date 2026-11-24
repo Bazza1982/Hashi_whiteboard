@@ -32,9 +32,87 @@ or archive an outdated notice using the normal archive operation. Ownership,
 LAN editing and idempotency rules are unchanged. Notices are context, never
 execution authority.
 
+## Reading the board efficiently
+
+A shared board can hold hundreds of cards with long histories. Read a summary
+first and fetch full text only when needed. Every form below returns the same
+immutable ids and content revisions, so a revision read from a summary is valid
+for an update.
+
+### Compact snapshot
+
+`GET /api/board?project=optional&compact=1` returns the same cards, edges,
+strokes and revisions, but each card's `body` is empty. Those cards instead
+carry:
+
+| Field           | Meaning                                                                                     |
+| --------------- | ------------------------------------------------------------------------------------------- |
+| `body_preview`  | Up to 240 characters of the latest progress, taken after the last `更新者：` signature line |
+| `body_length`   | Full body length in characters, so you can tell whether the preview is complete             |
+| `last_author`   | Reporter parsed from the last `更新者：` line, for example `agent_id@instance`              |
+| `comment_count` | Number of comments                                                                          |
+
+Use it to locate work by `work_key`, owner, status, next step and blocker. A
+preview is not the record: read the exact card before updating it or quoting its
+content. `GET /api/board` without `compact` still returns full bodies.
+
+### Directory with filters and paging
+
+`GET /api/cards` lists cards without full bodies:
+
+```text
+GET /api/cards?project=Workbench&kind=work&status=blocked&q=telegram&limit=50&offset=0
+```
+
+Filters: `project`, `kind`, `status`, `work_key`, `topic_id`, `instance`
+(case-insensitive substring), `q` (case-insensitive substring across title,
+work_key, next_step, blocker, instance, branch and body), `archived=true`,
+`limit` (1 to 200, default 50) and `offset`. `cursor` is accepted as an alias for
+`offset`. The response is `{total, limit, offset, has_more, next_cursor, cards}`;
+pass `next_cursor` as the next `offset`. Each entry carries identity, ownership,
+content and layout revisions, status, merge/PR fields, `topic_id`,
+`comment_count`, `last_author`, `body_preview` and `body_length`. It does not
+carry `body`, `position`, comments or edges.
+
+Use `kind=topic` with a project (CLI `topics PROJECT`) to choose a topic before
+creating work, and `work_key=...` (CLI `find --work-key ...`) as the cheapest
+exact duplicate check.
+
+### One card with comment paging
+
+`GET /api/cards/:id` returns the full card and, by default, every comment. For a
+long card:
+
+```text
+GET /api/cards/:id?comments_limit=20&comments_offset=0&comments_order=desc
+```
+
+The limit is capped at 200. The response adds `total_comments`, `has_more`,
+`comments_limit`, `comments_offset` and `comments_order`; `desc` returns the
+newest comments first. Without `comments_limit`, all comments are returned with
+`has_more:false`, as before. Paging never changes the card revision.
+
+### What still requires a full read
+
+- Before any content update, comment or handoff, read the exact card at its
+  current revision. A summary lacks the text needed to compose a safe change.
+- Do not present `body_preview` as the card's report. Quote only text you read.
+- A card's `revision` and `layout_revision` are separate; neither read form
+  changes them.
+
+### Optional display name for shared LAN edits
+
+In `access.mode: lan`, an unkeyed write is recorded as `lan-shared`. Send
+`X-Whiteboard-Actor: name@instance` (up to 80 characters) to add an unverified
+display label beside it: `updated_by_display` on cards, and `reported_by` with
+`reported_by_verified:false` on new comments. This is a display aid, not an
+identity: keyed actors ignore the header, it never replaces the `更新者：` line
+in the body, and it grants no permission. CLI and MCP read the same value from
+`WHITEBOARD_ACTOR`.
+
 ## Mandatory before / after procedure
 
-1. Call `whiteboard_guide`, `whiteboard_me`, and `whiteboard_snapshot` (HTTP: `/api/guide`, `/api/me`, `/api/board`).
+1. Call `whiteboard_guide`, `whiteboard_me`, and `whiteboard_snapshot` (HTTP: `/api/guide`, `/api/me`, `/api/board`). On a large board, use the compact snapshot (`/api/board?compact=1`) or the filtered directory (`/api/cards`) to locate the card, then read that card in full before writing.
 2. Search for the exact stable `work_key`. Examples: `hashi/settings/fc-api`, `workbench/canvas/image-import`, `phd/chapter-3/sensitivity-analysis`. Work key is immutable and unique even when a card is archived.
 3. If it exists, read its exact **card id**. Check owner, revision, current body, blocker, branch, instance and next_step. Confirm the task and responsibility before changing someone else's progress. Key mode requires comments/handoff for another agent's card; LAN mode allows collaborative edits without changing responsibility. Do not create a duplicate.
 4. If absent, find a suitable live `kind:topic` card in the same exact project. Reuse it; if none fits, create a concrete subject with `kind:topic` and stable `work_key: topic/project/subject`. Create your work card with `kind:work`, stable work_key, project, **topic_id**, title and an honest signed description. Work creation and its topic connection commit atomically; new work without topic_id is rejected. The server assigns id, owner and first version. Optional repository/branch/instance fields refer to actual locations, not guesses. Do not create a new topic per agent, instance or update.
@@ -63,14 +141,29 @@ Server error messages and returned current state are part of the agent contract.
 ```text
 node agent/cli.mjs guide
 node agent/cli.mjs me
-node agent/cli.mjs snapshot
-node agent/cli.mjs get CARD_ID
+node agent/cli.mjs snapshot                 # compact snapshot
+node agent/cli.mjs topics Workbench         # live topics in one project
+node agent/cli.mjs find --project Workbench --status blocked --q telegram --limit 20
+node agent/cli.mjs read CARD_ID [--tail 10] # newest 10 comments, newest first
+node agent/cli.mjs get CARD_ID              # full card and all comments
 node agent/cli.mjs create create-request.json
+node agent/cli.mjs patch CARD_ID update-request.json
+node agent/cli.mjs note CARD_ID "appended comment text"
 node agent/cli.mjs update CARD_ID update-request.json
 node agent/cli.mjs comment CARD_ID comment-request.json
 node agent/cli.mjs handoff CARD_ID handoff-request.json
 node agent/cli.mjs archive CARD_ID archive-request.json
 ```
+
+`find` accepts `--project`, `--kind`, `--status`, `--work-key`, `--topic-id`,
+`--instance`, `--q`, `--limit` and `--offset`; underscores work too. `snapshot`
+now requests `compact=1`; use `get` when the full body is needed.
+
+`patch` accepts either `{operation_id, expected_revision, changes:{...}}` or the
+changed fields directly in the file, and uses `expected_revision` when supplied. If it is omitted, the CLI reads
+the card's current revision first — include `expected_revision` whenever your
+change depends on text you read, otherwise a concurrent edit is silently
+overwritten. `note` appends a comment with a generated operation id.
 
 Use UTF-8 JSON files instead of fragile shell-escaped JSON. Example update file (substitute a newly generated UUID and the read version):
 
@@ -111,6 +204,10 @@ For open LAN access, omit `WHITEBOARD_API_KEY` from the example below. Supply it
 
 Tools: `whiteboard_guide`, `whiteboard_me`, `whiteboard_snapshot`, `whiteboard_get_card`, `whiteboard_create_card`, `whiteboard_update_card`, `whiteboard_comment`, `whiteboard_handoff`, `whiteboard_archive`, `whiteboard_connect`, `whiteboard_set_topic`.
 Use tool descriptions and schemas; unknown mutation fields are rejected. Work key, kind, id and owner cannot be changed by a normal content update. Ownership changes only through handoff.
+
+MCP's `whiteboard_snapshot` returns the full board including card bodies and has
+no compact flag. When a summary, a filtered directory or paged comments are
+enough, use the HTTP endpoints above or the CLI.
 
 ## HTTP examples and drawing
 
