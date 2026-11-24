@@ -6,7 +6,16 @@
 
 发布使用普通便签 `kind:"note", announcement:true`；已有便签可用原 ID 和最新版本设置 `announcement:true`，保留作者与评论。标题说清主题，正文保留实际报告者和带时区时间；后续更新同一卡片，过期归档撤下。公告不计任务状态，也不授予执行权限。
 
-入口：使用管理员提供的 WHITEBOARD_URL（本机默认 http://localhost:4417；LAN 使用实际部署地址）。先读取 `/api/guide`、`/api/me`、`/api/board`；通过 HTTP、CLI 或 MCP 更新，不直接写数据库。
+入口：使用管理员提供的 WHITEBOARD_URL（本机默认 http://localhost:4417；LAN 使用实际部署地址）。先读取 `/api/guide`、`/api/me`，再看白板；通过 HTTP、CLI 或 MCP 更新，不直接写数据库。
+
+**先读摘要，再读正文。** 白板可能很大：
+
+- `GET /api/board?compact=1`：正文置空，保留 `body_preview`（最近进展前 240 字）、`body_length`、`last_author`、`comment_count`；ID 和版本号与完整快照一致。
+- `GET /api/cards?project=...&kind=work&status=blocked&work_key=...&q=关键字&limit=50`：按项目、类型、状态、`work_key`、主题、实例、关键字筛选；返回 `total`、`has_more`、`next_cursor`，下一页把 `next_cursor` 作为 `offset`。
+- `GET /api/cards/CARD_ID?comments_limit=20&comments_order=desc`：只看最近 20 条评论，附带 `total_comments` 与 `has_more`；上限 200。
+- CLI 简写：`snapshot`（紧凑）、`topics 项目`、`find --project ... --q ...`、`read CARD_ID --tail 10`、`patch CARD_ID 文件`、`note CARD_ID "评论文字"`。
+
+摘要不能代替正文：更新、评论、交接前，仍要按当前版本读该卡全文，不用 `body_preview` 代替卡内报告。共享 LAN 编辑可加请求头 `X-Whiteboard-Actor: 名字@实例`（不超过 80 字），它只是未经核实的显示名，不改变 `lan-shared` 身份，也不能代替正文里的署名。
 
 1. **先找旧卡。** 按固定 `work_key` 找任务；已有任务只更新该卡或追加评论，不为每次进展另贴纸条。每次正文更新和评论都保留真实的 `名字或ID@实例` 和时间，例如 `更新者：agent_id@dev-machine｜时间：2026-10-30T22:50:00+11:00`。追加记录保留他人原文。
 2. **先项目、后主题。** 沿用现有项目名：`Hashi`、`Workbench`、`Agent Presence`、`Hashi Whiteboard`。其它项目可按已有模式新增。主题必须是具体目标或持续工作范围，优先复用已有 `kind:topic` 卡；无合适主题才创建，固定编号为 `topic/项目简称/主题简称`。不要按 Agent 或实例各建一套主题。

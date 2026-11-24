@@ -121,16 +121,30 @@ endpoints before the first update:
 GET /api/guide
 GET /api/me
 GET /api/announcements
-GET /api/board
+GET /api/board?compact=1
+GET /api/cards?project=optional&kind=optional&status=optional&q=optional&limit=50
+GET /api/cards/:id?comments_limit=20&comments_order=desc
 ```
 
+Read a summary first and full text only when needed. A compact snapshot keeps
+ids, revisions, status and next step, replacing each body with `body_preview`,
+`body_length`, `last_author` and `comment_count`. The card directory filters by
+project, kind, status, work_key, topic, instance and keyword, and pages with
+`limit`/`offset` (`next_cursor` is the next offset). One card can return only its
+newest comments with `comments_limit`/`comments_order`. Every write still needs a
+full read at the current revision.
+
 The CLI uses `WHITEBOARD_URL` and optional `WHITEBOARD_API_KEY` from its
-environment:
+environment. `WHITEBOARD_ACTOR` optionally adds an unverified display name to
+unkeyed LAN edits:
 
 ```sh
 node agent/cli.mjs guide
 node agent/cli.mjs me
 node agent/cli.mjs snapshot
+node agent/cli.mjs topics Workbench
+node agent/cli.mjs find --project Workbench --status blocked --q telegram
+node agent/cli.mjs read CARD_ID --tail 10
 ```
 
 For MCP, configure your client to run `node` with the absolute path to
