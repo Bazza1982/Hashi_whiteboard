@@ -271,9 +271,11 @@ function Board({ actor, access, onSignIn, onLogout }) {
     drawing = useRef(false),
     snapshotRequest = useRef(0),
     lastBoardRevision = useRef(0),
+    archivedRef = useRef(archived),
     draftGuard = useRef(null),
     canvasRef = useRef(),
     overviewProject = useRef(null);
+  archivedRef.current = archived;
   const [searchMatchIds, setSearchMatchIds] = useState(null);
   const selectCard = (id) => {
     if (id !== selected && draftGuard.current && !draftGuard.current())
@@ -283,19 +285,20 @@ function Board({ actor, access, onSignIn, onLogout }) {
   };
   const refresh = useCallback(async () => {
     const ticket = ++snapshotRequest.current;
+    const includeArchived = archivedRef.current;
     const params = new URLSearchParams({ compact: "1" });
-    if (archived) params.set("archived", "true");
+    if (includeArchived) params.set("archived", "true");
     const result = await api(`/api/board?${params.toString()}`);
-    if (ticket === snapshotRequest.current) {
+    if (ticket === snapshotRequest.current && archivedRef.current === includeArchived) {
       lastBoardRevision.current = Math.max(lastBoardRevision.current, result.revision || 0);
       setBoard(result);
       setLoaded(true);
     }
     return result;
-  }, [archived]);
+  }, []);
   useEffect(() => {
     refresh().catch((e) => setError(e.message));
-  }, [refresh]);
+  }, [archived, refresh]);
   useEffect(() => {
     const trimmed = query.trim();
     if (!trimmed) {
@@ -303,16 +306,22 @@ function Board({ actor, access, onSignIn, onLogout }) {
       return;
     }
     let cancelled = false;
-    const params = new URLSearchParams({ q: trimmed, limit: "200" });
-    if (archived) params.set("archived", "true");
-    if (project) params.set("project", project);
-    api(`/api/cards?${params.toString()}`)
-      .then((res) => {
-        if (!cancelled) setSearchMatchIds(new Set((res.cards || []).map((c) => c.id)));
-      })
-      .catch(() => {
-        if (!cancelled) setSearchMatchIds(null);
-      });
+    (async () => {
+      const matched = new Set();
+      let cursor = null;
+      do {
+        const params = new URLSearchParams({ q: trimmed, limit: "200" });
+        if (archived) params.set("archived", "true");
+        if (project) params.set("project", project);
+        if (cursor) params.set("cursor", cursor);
+        const res = await api(`/api/cards?${params.toString()}`);
+        for (const c of res.cards || []) matched.add(c.id);
+        cursor = res.has_more ? res.next_cursor : null;
+      } while (cursor && !cancelled);
+      if (!cancelled) setSearchMatchIds(matched);
+    })().catch(() => {
+      if (!cancelled) setSearchMatchIds(null);
+    });
     return () => { cancelled = true; };
   }, [query, archived, project, board.revision]);
   useEffect(() => {
@@ -730,7 +739,11 @@ function Board({ actor, access, onSignIn, onLogout }) {
             <input
               type="checkbox"
               checked={archived}
-              onChange={(e) => setArchived(e.target.checked)}
+              onChange={(e) => {
+                const next = e.target.checked;
+                archivedRef.current = next;
+                setArchived(next);
+              }}
             />{" "}
             显示归档
           </label>

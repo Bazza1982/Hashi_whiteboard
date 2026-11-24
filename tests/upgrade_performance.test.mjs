@@ -231,4 +231,16 @@ test("benchmark: 1000 active + 10000 archived cards keep directory <= 50KB and P
   const p95 = latencies[Math.floor(latencies.length * 0.95) - 1];
   assert.equal(lastPayloadBytes < 50 * 1024, true, `Directory payload ${lastPayloadBytes}B exceeded 50KB`);
   assert.equal(p95 < 200, true, `Directory P95 ${p95.toFixed(1)}ms exceeded 200ms`);
+
+  // Verify paginated search collects all >200 matching cards via next_cursor
+  const allMatched = new Set();
+  let cursor = null;
+  do {
+    const qs = new URLSearchParams({ q: "Benchmark Task", limit: "200" });
+    if (cursor) qs.set("cursor", cursor);
+    const page = await jsonReq(baseUrl, `/api/cards?${qs.toString()}`);
+    for (const c of page.body.cards) allMatched.add(c.id);
+    cursor = page.body.has_more ? page.body.next_cursor : null;
+  } while (cursor);
+  assert.equal(allMatched.size, 1000);
 });
