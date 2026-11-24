@@ -29,7 +29,9 @@ export class BoardStore {
       CREATE TABLE IF NOT EXISTS actors (id TEXT PRIMARY KEY, name TEXT NOT NULL, role TEXT NOT NULL, token_hash TEXT UNIQUE NOT NULL, disabled INTEGER NOT NULL DEFAULT 0);
       CREATE TABLE IF NOT EXISTS entities (id TEXT PRIMARY KEY, kind TEXT NOT NULL, work_key TEXT, document TEXT NOT NULL);
       CREATE UNIQUE INDEX IF NOT EXISTS unique_work ON entities(work_key) WHERE kind='card' AND work_key IS NOT NULL;
+      CREATE INDEX IF NOT EXISTS entities_kind_idx ON entities(kind);
       CREATE TABLE IF NOT EXISTS comments (id TEXT PRIMARY KEY, card_id TEXT NOT NULL, document TEXT NOT NULL);
+      CREATE INDEX IF NOT EXISTS comments_card_idx ON comments(card_id);
       CREATE TABLE IF NOT EXISTS operations (actor_id TEXT NOT NULL, key TEXT NOT NULL, fingerprint TEXT NOT NULL, response TEXT NOT NULL, created_at TEXT NOT NULL, PRIMARY KEY(actor_id,key));
       CREATE TABLE IF NOT EXISTS activity (seq INTEGER PRIMARY KEY AUTOINCREMENT, document TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS assets (id TEXT PRIMARY KEY, mime TEXT NOT NULL, body BLOB NOT NULL, created_at TEXT NOT NULL);
@@ -139,6 +141,7 @@ export class BoardStore {
       id: randomUUID(),
       card_id: cardId,
       actor_id: actor.id,
+      ...(actor.display_actor ? { reported_by: actor.display_actor.name, reported_by_verified: false } : {}),
       body,
       system,
       created_at: now(),
@@ -148,14 +151,135 @@ export class BoardStore {
       .run(item.id, cardId, JSON.stringify(item));
     return item;
   }
-  readCard(id) {
+  readCard(id, { commentsLimit = null, commentsOffset = 0, commentsOrder = "asc" } = {}) {
     const card = this.get(id);
+    const total = Number(
+      this.db
+        .prepare("SELECT count(*) AS n FROM comments WHERE card_id=?")
+        .get(id)?.n || 0,
+    );
+    const desc = commentsOrder === "desc";
+    if (Number.isInteger(commentsLimit) && commentsLimit > 0) {
+      const limit = Math.min(200, commentsLimit);
+      const offset = Math.max(0, Number.isInteger(commentsOffset) ? commentsOffset : 0);
+      const comments = this.db
+        .prepare(
+          `SELECT document FROM comments WHERE card_id=? ORDER BY rowid ${desc ? "DESC" : "ASC"} LIMIT ? OFFSET ?`,
+        )
+        .all(id, limit, offset)
+        .map(decode);
+      return {
+        ...card,
+        comments,
+        total_comments: total,
+        has_more: offset + comments.length < total,
+        comments_limit: limit,
+        comments_offset: offset,
+        comments_order: desc ? "desc" : "asc",
+      };
+    }
+    const comments = this.db
+      .prepare(`SELECT document FROM comments WHERE card_id=? ORDER BY rowid ${desc ? "DESC" : "ASC"}`)
+      .all(id)
+      .map(decode);
     return {
       ...card,
-      comments: this.db
-        .prepare("SELECT document FROM comments WHERE card_id=? ORDER BY rowid")
-        .all(id)
-        .map(decode),
+      comments,
+      total_comments: total,
+      has_more: false,
+    };
+  }
+  _commentCounts() {
+    return new Map(
+      this.db
+        .prepare("SELECT card_id,count(*) AS n FROM comments GROUP BY card_id")
+        .all()
+        .map((x) => [x.card_id, x.n]),
+    );
+  }
+  _topicMap() {
+    const map = new Map();
+    for (const e of this.list("edge")) {
+      if (relationOf(e) === "contains") map.set(e.target, e.source);
+    }
+    return map;
+  }
+  listCards({
+    project = "",
+    kind = "",
+    status = "",
+    work_key = "",
+    topic_id = "",
+    instance = "",
+    q = "",
+    archived = false,
+    limit = 50,
+    offset = 0,
+  } = {}) {
+    const boundedLimit = Math.max(1, Math.min(200, Number.isInteger(limit) ? limit : 50));
+    const boundedOffset = Math.max(0, Number.isInteger(offset) ? offset : 0);
+    const qLower = String(q || "").trim().toLowerCase();
+    const instLower = String(instance || "").trim().toLowerCase();
+    const topics = this._topicMap();
+    const counts = this._commentCounts();
+    const matched = this.list("card")
+      .filter((c) => {
+        if (!archived && c.archived_at) return false;
+        if (project && c.project !== project) return false;
+        if (kind && c.kind !== kind) return false;
+        if (status && c.status !== status) return false;
+        if (work_key && c.work_key !== work_key) return false;
+        const cardTopic = topics.get(c.id) || "";
+        if (topic_id && cardTopic !== topic_id) return false;
+        if (instLower && !String(c.instance || "").toLowerCase().includes(instLower)) return false;
+        if (qLower) {
+          const hit = [c.title, c.work_key, c.next_step, c.blocker, c.instance, c.branch, c.body]
+            .some((v) => String(v || "").toLowerCase().includes(qLower));
+          if (!hit) return false;
+        }
+        return true;
+      })
+      .sort((a, b) => String(b.updated_at || "").localeCompare(String(a.updated_at || "")) || a.id.localeCompare(b.id));
+    const total = matched.length;
+    const page = matched.slice(boundedOffset, boundedOffset + boundedLimit).map((c) => {
+      const fullBody = c.body || "";
+      return {
+        id: c.id,
+        kind: c.kind,
+        work_key: c.work_key,
+        project: c.project,
+        topic_id: topics.get(c.id) || null,
+        title: c.title,
+        status: c.status,
+        merge_status: c.merge_status,
+        pr_url: c.pr_url,
+        repository: c.repository,
+        branch: c.branch,
+        instance: c.instance,
+        owner_id: c.owner_id,
+        revision: c.revision,
+        layout_revision: c.layout_revision,
+        next_step: c.next_step,
+        blocker: c.blocker,
+        announcement: Boolean(c.announcement),
+        archived_at: c.archived_at,
+        updated_at: c.updated_at,
+        updated_by: c.updated_by,
+        ...(c.updated_by_display ? { updated_by_display: c.updated_by_display } : {}),
+        comment_count: counts.get(c.id) || 0,
+        body_preview: fullBody.slice(0, 240),
+        body_length: fullBody.length,
+      };
+    });
+    const nextOffset = boundedOffset + page.length;
+    const hasMore = nextOffset < total;
+    return {
+      total,
+      limit: boundedLimit,
+      offset: boundedOffset,
+      has_more: hasMore,
+      next_cursor: hasMore ? String(nextOffset) : null,
+      cards: page,
     };
   }
   announcements() {
@@ -168,23 +292,30 @@ export class BoardStore {
           b.updated_at.localeCompare(a.updated_at) || a.id.localeCompare(b.id),
       );
   }
-  snapshot({ project = "", archived = false } = {}) {
+  snapshot({ project = "", archived = false, compact = false } = {}) {
     const cards = this.list("card").filter(
       (c) =>
         (archived || !c.archived_at) && (!project || c.project === project),
     );
     const ids = new Set(cards.map((c) => c.id));
-    const counts = new Map(
-      this.db
-        .prepare("SELECT card_id,count(*) AS n FROM comments GROUP BY card_id")
-        .all()
-        .map((x) => [x.card_id, x.n]),
-    );
+    const counts = this._commentCounts();
     return {
       contract: "hashi_whiteboard/v1",
       revision: this.revision(),
+      ...(compact ? { compact: true } : {}),
       announcements: this.announcements(),
-      cards: cards.map((c) => ({ ...c, comment_count: counts.get(c.id) || 0 })),
+      cards: cards.map((c) => {
+        const count = counts.get(c.id) || 0;
+        if (!compact) return { ...c, comment_count: count };
+        const fullBody = c.body || "";
+        return {
+          ...c,
+          body: "",
+          body_preview: fullBody.slice(0, 240),
+          body_length: fullBody.length,
+          comment_count: count,
+        };
+      }),
       edges: this.list("edge").filter(
         (e) => ids.has(e.source) && ids.has(e.target),
       ),
@@ -228,6 +359,7 @@ export class BoardStore {
       event = {
         seq: sequence,
         actor_id: actor.id,
+        ...(actor.display_actor ? { reported_by: actor.display_actor.name, reported_by_verified: false } : {}),
         action: value.action,
         item_id:
           value.item_id ||
@@ -235,6 +367,7 @@ export class BoardStore {
           value.edge?.id ||
           value.stroke?.id ||
           null,
+        ...(value.card?.project ? { project: value.card.project } : {}),
         at: now(),
       };
       this.db
@@ -283,11 +416,18 @@ export class BoardStore {
         archived: Boolean(prior?.archived_at),
       },
     );
-    fail(
-      content.kind !== "work" || topic_id,
-      "topic_required",
-      "New work requires topic_id. Read the board, reuse a topic in the same project, or create kind:topic with a stable work_key first.",
-    );
+    if (content.kind === "work" && !topic_id) {
+      const topics = this.list("card")
+        .filter((c) => c.kind === "topic" && !c.archived_at && c.project === content.project)
+        .map((t) => ({ id: t.id, work_key: t.work_key, title: t.title, project: t.project }));
+      fail(
+        false,
+        "topic_required",
+        "New work requires topic_id. Read the board, reuse a topic in the same project, or create kind:topic with a stable work_key first.",
+        400,
+        { required_fields: ["topic_id"], project: content.project, topics },
+      );
+    }
     let topic;
     if (topic_id) {
       topic = this.get(text(topic_id, "topic_id", 80, true));
@@ -331,6 +471,7 @@ export class BoardStore {
       created_at: now(),
       updated_at: now(),
       updated_by: actor.id,
+      ...(actor.display_actor ? { updated_by_display: actor.display_actor } : {}),
       archived_at: null,
     };
     this.save("card", card);
@@ -381,6 +522,7 @@ export class BoardStore {
       revision: card.revision + 1,
       updated_at: now(),
       updated_by: actor.id,
+      ...(actor.display_actor ? { updated_by_display: actor.display_actor } : {}),
     };
     this.save("card", next);
     return { action: "card.updated", card: next };

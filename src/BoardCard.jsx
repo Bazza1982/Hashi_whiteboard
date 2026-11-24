@@ -18,7 +18,8 @@ export const mergeLabels = {
 // memoized card, and plain-text rendering. No Workbench runtime dependencies.
 export default memo(function BoardCard({ data, selected }) {
   const { card, owner, memberCount } = data;
-  const lines = card.body.split(/\r?\n/);
+  const displayBody = card.body || card.body_preview || "";
+  const lines = displayBody.split(/\r?\n/);
   const signatures = lines
     .map((line, index) => ({ line, index }))
     .filter(({ line }) => /^\s*更新者[：:]/.test(line));
@@ -73,7 +74,7 @@ export default memo(function BoardCard({ data, selected }) {
         <img
           className="card-image"
           src={`/api/assets/${card.asset_id}`}
-          alt={card.body || card.title}
+          alt={displayBody || card.title}
           draggable="false"
         />
       ) : (

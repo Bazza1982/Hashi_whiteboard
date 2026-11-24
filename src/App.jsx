@@ -270,6 +270,9 @@ function Board({ actor, access, onSignIn, onLogout }) {
     fileInput = useRef(),
     drawing = useRef(false),
     snapshotRequest = useRef(0),
+    lastBoardRevision = useRef(0),
+    refreshInFlight = useRef(null),
+    refreshQueued = useRef(false),
     draftGuard = useRef(null),
     canvasRef = useRef(),
     overviewProject = useRef(null);
@@ -280,19 +283,45 @@ function Board({ actor, access, onSignIn, onLogout }) {
     return true;
   };
   const refresh = useCallback(async () => {
-    const ticket = ++snapshotRequest.current;
-    const result = await api("/api/board?archived=true");
-    if (ticket === snapshotRequest.current) {
-      setBoard(result);
-      setLoaded(true);
+    if (refreshInFlight.current) {
+      refreshQueued.current = true;
+      return refreshInFlight.current;
     }
-    return result;
-  }, []);
+    const run = (async () => {
+      const ticket = ++snapshotRequest.current;
+      const params = new URLSearchParams({ compact: "1" });
+      if (archived) params.set("archived", "true");
+      const result = await api(`/api/board?${params.toString()}`);
+      if (ticket === snapshotRequest.current) {
+        lastBoardRevision.current = Math.max(lastBoardRevision.current, result.revision || 0);
+        setBoard(result);
+        setLoaded(true);
+      }
+      return result;
+    })();
+    refreshInFlight.current = run;
+    try {
+      return await run;
+    } finally {
+      if (refreshInFlight.current === run) refreshInFlight.current = null;
+      if (refreshQueued.current) {
+        refreshQueued.current = false;
+        void refresh();
+      }
+    }
+  }, [archived]);
   useEffect(() => {
     refresh().catch((e) => setError(e.message));
+  }, [refresh]);
+  useEffect(() => {
     const source = new EventSource("/api/events");
-    source.addEventListener("change", () => {
+    source.addEventListener("change", (event) => {
       setConnected(true);
+      let seq = null;
+      try {
+        seq = JSON.parse(event.data || "{}")?.seq ?? null;
+      } catch {}
+      if (Number.isInteger(seq) && seq <= lastBoardRevision.current) return;
       refresh().catch((e) => setError(e.message));
     });
     source.onerror = () => setConnected(false);
@@ -319,7 +348,7 @@ function Board({ actor, access, onSignIn, onLogout }) {
         (archived || !c.archived_at) &&
         (!project || c.project === project) &&
         (!query ||
-          [c.title, c.body, c.work_key, c.branch, c.instance].some((t) =>
+          [c.title, c.body, c.body_preview, c.work_key, c.branch, c.instance].some((t) =>
             t?.toLowerCase().includes(query.toLowerCase()),
           )),
     )
@@ -948,11 +977,11 @@ function Board({ actor, access, onSignIn, onLogout }) {
           )}
           {busy && <div className="saving">正在保存…</div>}
         </main>
-        {selected && board.cards.some((c) => c.id === selected) && (
+        {selected && (
           <Inspector
             key={selected}
             id={selected}
-            latest={board.cards.find((c) => c.id === selected)}
+            latest={board.cards.find((c) => c.id === selected) || null}
             actor={actor}
             sharedEdit={sharedEdit}
             actors={board.actors}
@@ -1300,13 +1329,13 @@ function Inspector({
     read().catch((e) => setError(e.message));
   }, [read]);
   useEffect(() => {
-    if (!base || latest.comment_count === base.comments?.length) return;
+    if (!base || !latest || latest.comment_count === base.comments?.length) return;
     api(`/api/cards/${id}`)
       .then((x) =>
         setBase((b) => (b ? { ...b, comments: x.card.comments } : b)),
       )
       .catch(() => {});
-  }, [latest.comment_count, id, base?.comments?.length]);
+  }, [latest?.comment_count, id, base?.comments?.length]);
   const dirty = Boolean(
     base && form && CARD_FIELDS.some((k) => form[k] !== fieldValue(base, k)),
   );
@@ -1335,7 +1364,7 @@ function Inspector({
     );
   const canWrite =
       sharedEdit || actor.role === "human" || base.owner_id === actor.id,
-    conflict = latest.revision !== base.revision;
+    conflict = Boolean(latest && latest.revision !== base.revision);
   const change = (key) => (e) =>
     setForm((f) => ({ ...f, [key]: e.target.value }));
   const apply = async (fn) => {
@@ -1398,7 +1427,7 @@ function Inspector({
         {conflict && (
           <div className="conflict">
             <b>有更新，当前草稿已保留。</b>
-            <p>最新内容：{latest.body || latest.title}</p>
+            <p>最新内容：{latest?.body || latest?.body_preview || latest?.title}</p>
             <button onClick={() => copy(JSON.stringify(form, null, 2))}>
               复制我的草稿
             </button>

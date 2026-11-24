@@ -162,6 +162,12 @@ export function createApp({
       "Sign in or send your assigned Bearer key.",
       401,
     );
+    if (access.shared_edit && req.actor.id === "lan-shared") {
+      const display = String(req.get("x-whiteboard-actor") || "").trim();
+      if (display && display.length <= 80) {
+        req.actor = { ...req.actor, display_actor: { name: display, verified: false } };
+      }
+    }
     next();
   });
   app.delete("/api/session", (req, res) => {
@@ -203,12 +209,44 @@ export function createApp({
       store.snapshot({
         project: String(req.query.project || ""),
         archived: req.query.archived === "true",
+        compact: req.query.compact === "1" || req.query.compact === "true" || req.query.summary === "true",
       }),
     ),
   );
-  app.get("/api/cards/:id", (req, res) =>
-    res.json({ card: store.readCard(req.params.id) }),
-  );
+  app.get("/api/cards", (req, res) => {
+    const rawLimit = req.query.limit !== undefined ? Number.parseInt(String(req.query.limit), 10) : 50;
+    const rawOffset = req.query.cursor !== undefined
+      ? Number.parseInt(String(req.query.cursor), 10)
+      : req.query.offset !== undefined
+        ? Number.parseInt(String(req.query.offset), 10)
+        : 0;
+    res.json(
+      store.listCards({
+        project: String(req.query.project || ""),
+        kind: String(req.query.kind || ""),
+        status: String(req.query.status || ""),
+        work_key: String(req.query.work_key || ""),
+        topic_id: String(req.query.topic_id || ""),
+        instance: String(req.query.instance || ""),
+        q: String(req.query.q || ""),
+        archived: req.query.archived === "true",
+        limit: Number.isFinite(rawLimit) ? rawLimit : 50,
+        offset: Number.isFinite(rawOffset) ? rawOffset : 0,
+      }),
+    );
+  });
+  app.get("/api/cards/:id", (req, res) => {
+    const rawLimit = req.query.comments_limit !== undefined ? Number.parseInt(String(req.query.comments_limit), 10) : null;
+    const rawOffset = req.query.comments_offset !== undefined ? Number.parseInt(String(req.query.comments_offset), 10) : 0;
+    const commentsOrder = req.query.comments_order === "desc" ? "desc" : "asc";
+    res.json({
+      card: store.readCard(req.params.id, {
+        commentsLimit: Number.isFinite(rawLimit) ? rawLimit : null,
+        commentsOffset: Number.isFinite(rawOffset) ? rawOffset : 0,
+        commentsOrder,
+      }),
+    });
+  });
   const mutate = (fn) => (req, res) => {
     const body = Buffer.isBuffer(req.body)
       ? hash(req.body)
