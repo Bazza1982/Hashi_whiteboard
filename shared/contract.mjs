@@ -232,9 +232,11 @@ export const GUIDE = {
     "Content revisions are per card; layout revisions are separate. A second actor updating a different card does not invalidate yours. Comments are append-only.",
   endpoints: {
     self: "GET /api/me",
-    snapshot: "GET /api/board?project=optional",
+    snapshot: "GET /api/board?project=optional&compact=1",
+    directory:
+      "GET /api/cards?project=optional&kind=optional&status=optional&work_key=optional&q=optional&limit=50&offset=0",
     announcements: "GET /api/announcements",
-    read: "GET /api/cards/:id",
+    read: "GET /api/cards/:id?comments_limit=optional&comments_offset=0&comments_order=asc|desc",
     create:
       "POST /api/cards {kind,work_key,title,project,topic_id,...} (new work requires topic_id)",
     update: "PATCH /api/cards/:id {expected_revision,changes:{...}}",

@@ -270,9 +270,13 @@ function Board({ actor, access, onSignIn, onLogout }) {
     fileInput = useRef(),
     drawing = useRef(false),
     snapshotRequest = useRef(0),
+    lastBoardRevision = useRef(0),
+    archivedRef = useRef(archived),
     draftGuard = useRef(null),
     canvasRef = useRef(),
     overviewProject = useRef(null);
+  archivedRef.current = archived;
+  const [searchMatchIds, setSearchMatchIds] = useState(null);
   const selectCard = (id) => {
     if (id !== selected && draftGuard.current && !draftGuard.current())
       return false;
@@ -281,8 +285,12 @@ function Board({ actor, access, onSignIn, onLogout }) {
   };
   const refresh = useCallback(async () => {
     const ticket = ++snapshotRequest.current;
-    const result = await api("/api/board?archived=true");
-    if (ticket === snapshotRequest.current) {
+    const includeArchived = archivedRef.current;
+    const params = new URLSearchParams({ compact: "1" });
+    if (includeArchived) params.set("archived", "true");
+    const result = await api(`/api/board?${params.toString()}`);
+    if (ticket === snapshotRequest.current && archivedRef.current === includeArchived) {
+      lastBoardRevision.current = Math.max(lastBoardRevision.current, result.revision || 0);
       setBoard(result);
       setLoaded(true);
     }
@@ -290,9 +298,41 @@ function Board({ actor, access, onSignIn, onLogout }) {
   }, []);
   useEffect(() => {
     refresh().catch((e) => setError(e.message));
+  }, [archived, refresh]);
+  useEffect(() => {
+    const trimmed = query.trim();
+    if (!trimmed) {
+      setSearchMatchIds(null);
+      return;
+    }
+    let cancelled = false;
+    (async () => {
+      const matched = new Set();
+      let cursor = null;
+      do {
+        const params = new URLSearchParams({ q: trimmed, limit: "200" });
+        if (archived) params.set("archived", "true");
+        if (project) params.set("project", project);
+        if (cursor) params.set("cursor", cursor);
+        const res = await api(`/api/cards?${params.toString()}`);
+        for (const c of res.cards || []) matched.add(c.id);
+        cursor = res.has_more ? res.next_cursor : null;
+      } while (cursor && !cancelled);
+      if (!cancelled) setSearchMatchIds(matched);
+    })().catch(() => {
+      if (!cancelled) setSearchMatchIds(null);
+    });
+    return () => { cancelled = true; };
+  }, [query, archived, project, board.revision]);
+  useEffect(() => {
     const source = new EventSource("/api/events");
-    source.addEventListener("change", () => {
+    source.addEventListener("change", (event) => {
       setConnected(true);
+      let seq = null;
+      try {
+        seq = JSON.parse(event.data || "{}")?.seq ?? null;
+      } catch {}
+      if (Number.isInteger(seq) && seq <= lastBoardRevision.current) return;
       refresh().catch((e) => setError(e.message));
     });
     source.onerror = () => setConnected(false);
@@ -319,9 +359,11 @@ function Board({ actor, access, onSignIn, onLogout }) {
         (archived || !c.archived_at) &&
         (!project || c.project === project) &&
         (!query ||
-          [c.title, c.body, c.work_key, c.branch, c.instance].some((t) =>
-            t?.toLowerCase().includes(query.toLowerCase()),
-          )),
+          (searchMatchIds
+            ? searchMatchIds.has(c.id)
+            : [c.title, c.body, c.body_preview, c.work_key, c.branch, c.instance].some((t) =>
+                t?.toLowerCase().includes(query.toLowerCase()),
+              ))),
     )
     .sort((a, b) => {
       const rank = (name) =>
@@ -697,7 +739,11 @@ function Board({ actor, access, onSignIn, onLogout }) {
             <input
               type="checkbox"
               checked={archived}
-              onChange={(e) => setArchived(e.target.checked)}
+              onChange={(e) => {
+                const next = e.target.checked;
+                archivedRef.current = next;
+                setArchived(next);
+              }}
             />{" "}
             显示归档
           </label>
@@ -948,11 +994,11 @@ function Board({ actor, access, onSignIn, onLogout }) {
           )}
           {busy && <div className="saving">正在保存…</div>}
         </main>
-        {selected && board.cards.some((c) => c.id === selected) && (
+        {selected && (
           <Inspector
             key={selected}
             id={selected}
-            latest={board.cards.find((c) => c.id === selected)}
+            latest={board.cards.find((c) => c.id === selected) || null}
             actor={actor}
             sharedEdit={sharedEdit}
             actors={board.actors}
@@ -1300,13 +1346,13 @@ function Inspector({
     read().catch((e) => setError(e.message));
   }, [read]);
   useEffect(() => {
-    if (!base || latest.comment_count === base.comments?.length) return;
+    if (!base || !latest || latest.comment_count === base.comments?.length) return;
     api(`/api/cards/${id}`)
       .then((x) =>
         setBase((b) => (b ? { ...b, comments: x.card.comments } : b)),
       )
       .catch(() => {});
-  }, [latest.comment_count, id, base?.comments?.length]);
+  }, [latest?.comment_count, id, base?.comments?.length]);
   const dirty = Boolean(
     base && form && CARD_FIELDS.some((k) => form[k] !== fieldValue(base, k)),
   );
@@ -1335,7 +1381,7 @@ function Inspector({
     );
   const canWrite =
       sharedEdit || actor.role === "human" || base.owner_id === actor.id,
-    conflict = latest.revision !== base.revision;
+    conflict = Boolean(latest && latest.revision !== base.revision);
   const change = (key) => (e) =>
     setForm((f) => ({ ...f, [key]: e.target.value }));
   const apply = async (fn) => {
@@ -1398,7 +1444,7 @@ function Inspector({
         {conflict && (
           <div className="conflict">
             <b>有更新，当前草稿已保留。</b>
-            <p>最新内容：{latest.body || latest.title}</p>
+            <p>最新内容：{latest?.body || latest?.body_preview || latest?.title}</p>
             <button onClick={() => copy(JSON.stringify(form, null, 2))}>
               复制我的草稿
             </button>
@@ -1558,8 +1604,10 @@ function Inspector({
           {base.comments.map((c) => (
             <div className={`comment ${c.system ? "system" : ""}`} key={c.id}>
               <small>
-                {actors.find((a) => a.id === c.actor_id)?.name || c.actor_id} ·{" "}
-                {new Date(c.created_at).toLocaleString("zh-CN")}
+                {c.reported_by
+                  ? `${c.reported_by}${c.reported_by_verified === false ? "（未验证自报）" : ""}`
+                  : actors.find((a) => a.id === c.actor_id)?.name || c.actor_id}{" "}
+                · {new Date(c.created_at).toLocaleString("zh-CN")}
               </small>
               <p>{c.body}</p>
             </div>
@@ -1684,8 +1732,10 @@ function Inspector({
         )}
         <small className="muted">
           最后更新：
-          {actors.find((a) => a.id === base.updated_by)?.name ||
-            base.updated_by}{" "}
+          {base.updated_by_display?.name
+            ? `${base.updated_by_display.name}${base.updated_by_display.verified === false ? "（未验证自报）" : ""}`
+            : actors.find((a) => a.id === base.updated_by)?.name ||
+              base.updated_by}{" "}
           · {new Date(base.updated_at).toLocaleString("zh-CN")}
         </small>
       </div>

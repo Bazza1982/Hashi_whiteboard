@@ -6,6 +6,7 @@ export async function request(
     operationId,
     url = process.env.WHITEBOARD_URL || "http://127.0.0.1:4417",
     token = process.env.WHITEBOARD_API_KEY,
+    actor = process.env.WHITEBOARD_ACTOR,
   } = {},
 ) {
   const base = new URL(url);
@@ -27,6 +28,7 @@ export async function request(
     signal: AbortSignal.timeout(20000),
     headers: {
       ...(token ? { Authorization: `Bearer ${token}` } : {}),
+      ...(actor ? { "X-Whiteboard-Actor": actor } : {}),
       ...(body ? { "Content-Type": "application/json" } : {}),
       ...(operationId ? { "Idempotency-Key": operationId } : {}),
     },
