@@ -25,7 +25,7 @@ function parseFlags(rest) {
 const routes = {
   guide: ["GET", "/api/guide"],
   me: ["GET", "/api/me"],
-  snapshot: ["GET", "/api/board?compact=1"],
+  snapshot: ["GET", args.includes("--compact") ? "/api/board?compact=1" : "/api/board"],
   announcements: ["GET", "/api/announcements"],
   get: ["GET", `/api/cards/${encodeURIComponent(idOrFile || "")}`],
   create: ["POST", "/api/cards"],

@@ -271,11 +271,10 @@ function Board({ actor, access, onSignIn, onLogout }) {
     drawing = useRef(false),
     snapshotRequest = useRef(0),
     lastBoardRevision = useRef(0),
-    refreshInFlight = useRef(null),
-    refreshQueued = useRef(false),
     draftGuard = useRef(null),
     canvasRef = useRef(),
     overviewProject = useRef(null);
+  const [searchMatchIds, setSearchMatchIds] = useState(null);
   const selectCard = (id) => {
     if (id !== selected && draftGuard.current && !draftGuard.current())
       return false;
@@ -283,36 +282,39 @@ function Board({ actor, access, onSignIn, onLogout }) {
     return true;
   };
   const refresh = useCallback(async () => {
-    if (refreshInFlight.current) {
-      refreshQueued.current = true;
-      return refreshInFlight.current;
+    const ticket = ++snapshotRequest.current;
+    const params = new URLSearchParams({ compact: "1" });
+    if (archived) params.set("archived", "true");
+    const result = await api(`/api/board?${params.toString()}`);
+    if (ticket === snapshotRequest.current) {
+      lastBoardRevision.current = Math.max(lastBoardRevision.current, result.revision || 0);
+      setBoard(result);
+      setLoaded(true);
     }
-    const run = (async () => {
-      const ticket = ++snapshotRequest.current;
-      const params = new URLSearchParams({ compact: "1" });
-      if (archived) params.set("archived", "true");
-      const result = await api(`/api/board?${params.toString()}`);
-      if (ticket === snapshotRequest.current) {
-        lastBoardRevision.current = Math.max(lastBoardRevision.current, result.revision || 0);
-        setBoard(result);
-        setLoaded(true);
-      }
-      return result;
-    })();
-    refreshInFlight.current = run;
-    try {
-      return await run;
-    } finally {
-      if (refreshInFlight.current === run) refreshInFlight.current = null;
-      if (refreshQueued.current) {
-        refreshQueued.current = false;
-        void refresh();
-      }
-    }
+    return result;
   }, [archived]);
   useEffect(() => {
     refresh().catch((e) => setError(e.message));
   }, [refresh]);
+  useEffect(() => {
+    const trimmed = query.trim();
+    if (!trimmed) {
+      setSearchMatchIds(null);
+      return;
+    }
+    let cancelled = false;
+    const params = new URLSearchParams({ q: trimmed, limit: "200" });
+    if (archived) params.set("archived", "true");
+    if (project) params.set("project", project);
+    api(`/api/cards?${params.toString()}`)
+      .then((res) => {
+        if (!cancelled) setSearchMatchIds(new Set((res.cards || []).map((c) => c.id)));
+      })
+      .catch(() => {
+        if (!cancelled) setSearchMatchIds(null);
+      });
+    return () => { cancelled = true; };
+  }, [query, archived, project, board.revision]);
   useEffect(() => {
     const source = new EventSource("/api/events");
     source.addEventListener("change", (event) => {
@@ -348,9 +350,11 @@ function Board({ actor, access, onSignIn, onLogout }) {
         (archived || !c.archived_at) &&
         (!project || c.project === project) &&
         (!query ||
-          [c.title, c.body, c.body_preview, c.work_key, c.branch, c.instance].some((t) =>
-            t?.toLowerCase().includes(query.toLowerCase()),
-          )),
+          (searchMatchIds
+            ? searchMatchIds.has(c.id)
+            : [c.title, c.body, c.body_preview, c.work_key, c.branch, c.instance].some((t) =>
+                t?.toLowerCase().includes(query.toLowerCase()),
+              ))),
     )
     .sort((a, b) => {
       const rank = (name) =>
@@ -1587,8 +1591,10 @@ function Inspector({
           {base.comments.map((c) => (
             <div className={`comment ${c.system ? "system" : ""}`} key={c.id}>
               <small>
-                {actors.find((a) => a.id === c.actor_id)?.name || c.actor_id} ·{" "}
-                {new Date(c.created_at).toLocaleString("zh-CN")}
+                {c.reported_by
+                  ? `${c.reported_by}${c.reported_by_verified === false ? "（未验证自报）" : ""}`
+                  : actors.find((a) => a.id === c.actor_id)?.name || c.actor_id}{" "}
+                · {new Date(c.created_at).toLocaleString("zh-CN")}
               </small>
               <p>{c.body}</p>
             </div>
@@ -1713,8 +1719,10 @@ function Inspector({
         )}
         <small className="muted">
           最后更新：
-          {actors.find((a) => a.id === base.updated_by)?.name ||
-            base.updated_by}{" "}
+          {base.updated_by_display?.name
+            ? `${base.updated_by_display.name}${base.updated_by_display.verified === false ? "（未验证自报）" : ""}`
+            : actors.find((a) => a.id === base.updated_by)?.name ||
+              base.updated_by}{" "}
           · {new Date(base.updated_at).toLocaleString("zh-CN")}
         </small>
       </div>

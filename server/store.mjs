@@ -19,6 +19,43 @@ import { tidyProjects } from "../shared/tidy.mjs";
 export const hash = (value) => createHash("sha256").update(value).digest("hex");
 const now = () => new Date().toISOString();
 const decode = (row) => (row ? JSON.parse(row.document) : null);
+
+function summarizeBody(fullBody = "") {
+  const lines = String(fullBody || "").split(/\r?\n/);
+  const signatures = lines
+    .map((line, index) => ({ line, index }))
+    .filter(({ line }) => /^\s*更新者[：:]/.test(line));
+  const signature = signatures.at(-1);
+  const lastAuthor = signature
+    ? signature.line
+        .replace(/^\s*更新者[：:]\s*/, "")
+        .split(/[｜|]/)[0]
+        .trim()
+    : "";
+  const latestLines = lines
+    .slice(signature ? signature.index + 1 : 0)
+    .filter((line) => !/^\s*(负责人|更新者|更新时间|时间)[：:]/.test(line))
+    .join("\n")
+    .trim();
+  const previewSource = latestLines || String(fullBody || "").trim();
+  return {
+    last_author: lastAuthor,
+    body_preview: previewSource.slice(0, 240),
+    body_length: String(fullBody || "").length,
+  };
+}
+
+function applyUpdatedBy(card, actor, patch = {}) {
+  const next = {
+    ...card,
+    ...patch,
+    updated_at: now(),
+    updated_by: actor.id,
+  };
+  if (actor.display_actor) next.updated_by_display = actor.display_actor;
+  else delete next.updated_by_display;
+  return next;
+}
 export class BoardStore {
   constructor(directory, adminKey, { sharedEdit = false } = {}) {
     this.sharedEdit = sharedEdit;
@@ -242,7 +279,7 @@ export class BoardStore {
       .sort((a, b) => String(b.updated_at || "").localeCompare(String(a.updated_at || "")) || a.id.localeCompare(b.id));
     const total = matched.length;
     const page = matched.slice(boundedOffset, boundedOffset + boundedLimit).map((c) => {
-      const fullBody = c.body || "";
+      const summary = summarizeBody(c.body || "");
       return {
         id: c.id,
         kind: c.kind,
@@ -267,8 +304,9 @@ export class BoardStore {
         updated_by: c.updated_by,
         ...(c.updated_by_display ? { updated_by_display: c.updated_by_display } : {}),
         comment_count: counts.get(c.id) || 0,
-        body_preview: fullBody.slice(0, 240),
-        body_length: fullBody.length,
+        last_author: summary.last_author,
+        body_preview: summary.body_preview,
+        body_length: summary.body_length,
       };
     });
     const nextOffset = boundedOffset + page.length;
@@ -307,12 +345,13 @@ export class BoardStore {
       cards: cards.map((c) => {
         const count = counts.get(c.id) || 0;
         if (!compact) return { ...c, comment_count: count };
-        const fullBody = c.body || "";
+        const summary = summarizeBody(c.body || "");
         return {
           ...c,
           body: "",
-          body_preview: fullBody.slice(0, 240),
-          body_length: fullBody.length,
+          last_author: summary.last_author,
+          body_preview: summary.body_preview,
+          body_length: summary.body_length,
           comment_count: count,
         };
       }),
@@ -516,14 +555,10 @@ export class BoardStore {
         "asset_id does not exist.",
         404,
       );
-    const next = {
-      ...card,
+    const next = applyUpdatedBy(card, actor, {
       ...content,
       revision: card.revision + 1,
-      updated_at: now(),
-      updated_by: actor.id,
-      ...(actor.display_actor ? { updated_by_display: actor.display_actor } : {}),
-    };
+    });
     this.save("card", next);
     return { action: "card.updated", card: next };
   }
@@ -590,13 +625,10 @@ export class BoardStore {
       );
       if (parent) this.requireLive(this.get(parent.source));
     }
-    const next = {
-      ...card,
+    const next = applyUpdatedBy(card, actor, {
       archived_at: data.archived ? now() : null,
       revision: card.revision + 1,
-      updated_at: now(),
-      updated_by: actor.id,
-    };
+    });
     this.save("card", next);
     return {
       action: data.archived ? "card.archived" : "card.restored",
@@ -619,13 +651,10 @@ export class BoardStore {
       404,
     );
     const note = text(data.note, "note", 4000, true);
-    const next = {
-      ...card,
+    const next = applyUpdatedBy(card, actor, {
       owner_id: nextOwner.id,
       revision: card.revision + 1,
-      updated_at: now(),
-      updated_by: actor.id,
-    };
+    });
     this.save("card", next);
     this.comment(
       id,

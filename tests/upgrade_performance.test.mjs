@@ -73,8 +73,8 @@ test("compact board, /api/cards directory, comment pagination, structured 400, a
   assert.deepEqual(missingTopic.body.error.required_fields, ["topic_id"]);
   assert.equal(missingTopic.body.error.topics.some((x) => x.id === topicId), true);
 
-  // 3. Create work card with long body and X-Whiteboard-Actor
-  const longBody = "A".repeat(12000);
+  // 3. Create work card with long body (including signature) and X-Whiteboard-Actor
+  const longBody = "A".repeat(500) + "\nNEEDLE_DEEP_IN_BODY\n---\n更新者：alice@HASHI4｜时间：2026-11-24T23:00:00+11:00\nLatest progress summary here";
   const workRes = await jsonReq(baseUrl, "/api/cards", {
     method: "POST",
     headers: { "X-Whiteboard-Actor": "xiaofang@A9_MAX" },
@@ -112,22 +112,54 @@ test("compact board, /api/cards directory, comment pagination, structured 400, a
   assert.equal(pagedDetail.body.card.comments.length, 5);
   assert.equal(pagedDetail.body.card.comments[0].body, "Comment #15");
 
-  // 5. Compact snapshot omits full body
+  // 5. Compact snapshot preserves last_author + latest progress preview
   const compact = await jsonReq(baseUrl, "/api/board?compact=1");
   assert.equal(compact.status, 200);
   assert.equal(compact.body.compact, true);
   const compactWork = compact.body.cards.find((c) => c.id === workId);
   assert.equal(compactWork.body, "");
-  assert.equal(compactWork.body_preview.length, 240);
-  assert.equal(compactWork.body_length, 12000);
+  assert.equal(compactWork.last_author, "alice@HASHI4");
+  assert.equal(compactWork.body_preview, "Latest progress summary here");
+  assert.equal(compactWork.body_length, longBody.length);
   assert.equal(compactWork.comment_count, 15);
 
-  // 6. /api/cards directory filtering
-  const dirRes = await jsonReq(baseUrl, "/api/cards?project=Workbench&kind=work&status=in_progress&q=Long");
+  // 6. /api/cards directory filtering finds deep body text
+  const dirRes = await jsonReq(baseUrl, "/api/cards?project=Workbench&kind=work&status=in_progress&q=NEEDLE_DEEP_IN_BODY");
   assert.equal(dirRes.status, 200);
   assert.equal(dirRes.body.total, 1);
   assert.equal(dirRes.body.cards[0].topic_id, topicId);
   assert.equal(dirRes.body.cards[0].body, undefined);
+
+  // 7. Updating/archiving/restoring/handing off without X-Whiteboard-Actor clears previous updated_by_display
+  const updateNoHeader = await jsonReq(baseUrl, `/api/cards/${workId}`, {
+    method: "PATCH",
+    body: { expected_revision: workRes.body.card.revision, changes: { status: "blocked", blocker: "waiting" } },
+  });
+  assert.equal(updateNoHeader.status, 200);
+  assert.equal(updateNoHeader.body.card.updated_by_display, undefined);
+
+  const archiveWithHeader = await jsonReq(baseUrl, `/api/cards/${workId}/archive`, {
+    method: "POST",
+    headers: { "X-Whiteboard-Actor": "archiver@A9_MAX" },
+    body: { expected_revision: updateNoHeader.body.card.revision, archived: true },
+  });
+  assert.equal(archiveWithHeader.status, 200);
+  assert.deepEqual(archiveWithHeader.body.card.updated_by_display, { name: "archiver@A9_MAX", verified: false });
+
+  const restoreNoHeader = await jsonReq(baseUrl, `/api/cards/${workId}/archive`, {
+    method: "POST",
+    body: { expected_revision: archiveWithHeader.body.card.revision, archived: false },
+  });
+  assert.equal(restoreNoHeader.status, 200);
+  assert.equal(restoreNoHeader.body.card.updated_by_display, undefined);
+
+  const handoffWithHeader = await jsonReq(baseUrl, `/api/cards/${workId}/handoff`, {
+    method: "POST",
+    headers: { "X-Whiteboard-Actor": "handoff@A9_MAX" },
+    body: { expected_revision: restoreNoHeader.body.card.revision, new_owner_id: "human-owner", note: "handoff test" },
+  });
+  assert.equal(handoffWithHeader.status, 200);
+  assert.deepEqual(handoffWithHeader.body.card.updated_by_display, { name: "handoff@A9_MAX", verified: false });
 });
 
 test("benchmark: 1000 active + 10000 archived cards keep directory <= 50KB and P95 < 200ms", async (t) => {

@@ -24,10 +24,14 @@ export default memo(function BoardCard({ data, selected }) {
     .map((line, index) => ({ line, index }))
     .filter(({ line }) => /^\s*更新者[：:]/.test(line));
   const signature = signatures.at(-1);
-  const author = signature?.line
-    .replace(/^\s*更新者[：:]\s*/, "")
-    .split(/[｜|]/)[0]
-    .trim();
+  const author =
+    signature?.line
+      .replace(/^\s*更新者[：:]\s*/, "")
+      .split(/[｜|]/)[0]
+      .trim() ||
+    card.last_author ||
+    card.updated_by_display?.name ||
+    "";
   const preview = lines
     .slice(signature ? signature.index + 1 : 0)
     .filter((line) => !/^\s*(负责人|更新者|更新时间|时间)[：:]/.test(line))
