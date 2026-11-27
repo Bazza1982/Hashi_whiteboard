@@ -1388,6 +1388,9 @@ function Inspector({
   }, [latest?.comment_count, id, base?.comments?.length]);
   // The stage list is configuration, so it is fetched instead of hard-coded.
   // A failed read leaves the select empty and the server still validates.
+  // The definition version is a dependency as well: relabelling or adding a
+  // stage must reach an already open detail panel, not only a new one.
+  const workflowVersion = board?.workflow?.version || 0;
   useEffect(() => {
     let live = true;
     api(`/api/workflow?project=${encodeURIComponent(base?.project || "")}`)
@@ -1398,7 +1401,7 @@ function Inspector({
     return () => {
       live = false;
     };
-  }, [base?.project]);
+  }, [base?.project, workflowVersion]);
   const dirty = Boolean(
     base && form && CARD_FIELDS.some((k) => form[k] !== fieldValue(base, k)),
   );

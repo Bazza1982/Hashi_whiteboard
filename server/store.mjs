@@ -23,6 +23,7 @@ import {
   normalizeWorkflow,
   stageIndex,
   defaultStageForStatus,
+  fuseTarget,
 } from "../shared/workflow.mjs";
 
 export const hash = (value) => createHash("sha256").update(value).digest("hex");
@@ -174,16 +175,21 @@ export class BoardStore {
     }
     return resolved;
   }
+  /** A positive round budget, or null when the value means "inherit". */
+  roundBudget(value) {
+    if (value === undefined || value === null || value === "") return null;
+    const n =
+      typeof value === "number"
+        ? value
+        : Number.parseInt(String(value).trim(), 10);
+    return Number.isSafeInteger(n) && n >= 1 ? n : null;
+  }
   effectiveMaxRounds(card, workflow, incoming) {
-    const pick = (value) => {
-      if (value === undefined || value === null || value === "") return null;
-      const n =
-        typeof value === "number"
-          ? value
-          : Number.parseInt(String(value).trim(), 10);
-      return Number.isSafeInteger(n) && n >= 1 ? n : null;
-    };
-    return pick(incoming) ?? pick(card?.max_rounds) ?? workflow.max_rounds;
+    return (
+      this.roundBudget(incoming) ??
+      this.roundBudget(card?.max_rounds) ??
+      workflow.max_rounds
+    );
   }
   /** Add derived stage display fields without rewriting the stored card. */
   decorateCard(card, workflow) {
@@ -249,16 +255,21 @@ export class BoardStore {
       const projects = { ...stored.projects };
       if (data.reset === true) delete projects[project];
       else {
-        const override = {};
+        fail(
+          ["stages", "max_rounds", "initial"].some(
+            (key) => data[key] !== undefined,
+          ),
+          "empty_changes",
+          `Supply stages, max_rounds or initial for project "${project}", or reset:true to drop its override.`,
+        );
+        // A project override is edited field by field: keep the parts this
+        // request does not mention so a max_rounds-only edit cannot silently
+        // drop the project's own stage list or initial stage.
+        const override = { ...(projects[project] || {}) };
         if (data.stages !== undefined) override.stages = data.stages;
         if (data.max_rounds !== undefined)
           override.max_rounds = data.max_rounds;
         if (data.initial !== undefined) override.initial = data.initial;
-        fail(
-          Object.keys(override).length,
-          "empty_changes",
-          `Supply stages, max_rounds or initial for project "${project}", or reset:true to drop its override.`,
-        );
         projects[project] = override;
       }
       document = { ...stored, projects, version: stored.version + 1 };
@@ -274,6 +285,7 @@ export class BoardStore {
       };
     }
     const validated = validateWorkflow(document);
+    this.assertCardsCanStillMove(validated, project);
     this.db
       .prepare(
         "INSERT INTO metadata(key,value) VALUES('workflow',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
@@ -286,6 +298,37 @@ export class BoardStore {
       workflow: this.workflow(project),
       version: validated.version,
     };
+  }
+  /**
+   * A definition edit must not strand cards that already exist: a live card
+   * whose stage disappears would fail its next move with unknown_stage, and a
+   * non-terminal stage with nowhere to go is a dead end.
+   */
+  assertCardsCanStillMove(document, project = "") {
+    const stranded = [];
+    for (const card of this.list("card")) {
+      if (card.kind !== "work" || card.archived_at || !card.stage) continue;
+      if (project && card.project !== project) continue;
+      const index = stageIndex(resolveWorkflow(document, card.project).stages);
+      const stage = index.get(card.stage);
+      const name = card.work_key || card.id;
+      if (!stage)
+        stranded.push(
+          `${name} stands on "${card.stage}", which this definition removes`,
+        );
+      else if (stage.category !== "terminal" && stage.allowed_next.length === 0)
+        stranded.push(
+          `${name} stands on "${stage.key}", which would have no next stage`,
+        );
+      if (stranded.length >= 5) break;
+    }
+    fail(
+      !stranded.length,
+      "workflow_strands_cards",
+      `This definition would leave existing cards unable to move: ${stranded.join("; ")}. Keep those stages, add a reachable next stage, or move the cards first.`,
+      409,
+      { stranded },
+    );
   }
   /** Validate a stage change, spend a review round and fuse over-long rework. */
   planTransition({ actor, card, workflow, from, to, changes }) {
@@ -328,28 +371,47 @@ export class BoardStore {
         403,
         { stage: to, human_gate: true },
       );
+    // Leaving a halted stage is a recovery, not another round of rework: it
+    // spends no budget and is never fused straight back where it came from.
+    const leavingHalt = current.category === "halted";
     let nextRound =
       Number.isSafeInteger(card.round) && card.round >= 1 ? card.round : 1;
-    if (target.counts_round) nextRound += 1;
-    const maxRounds = this.effectiveMaxRounds(
-      card,
-      workflow,
-      changes.max_rounds,
+    if (target.counts_round && !leavingHalt) nextRound += 1;
+    // A max_rounds carried by this same edit is the budget in force for it,
+    // including an explicit clear, which falls back to the workflow budget.
+    const changedBudget = Boolean(
+      changes && Object.prototype.hasOwnProperty.call(changes, "max_rounds"),
     );
+    const maxRounds = changedBudget
+      ? (this.roundBudget(changes.max_rounds) ?? workflow.max_rounds)
+      : this.effectiveMaxRounds(card, workflow);
     let stage = target;
     let blocker;
     let reason = "";
-    if (nextRound > maxRounds) {
-      const halted = index.get("blocked");
+    // Only a move that actually spends a round of rework can trip the fuse; a
+    // card left over budget by an earlier budget change still finishes its
+    // ordinary moves instead of being halted for walking forward.
+    if (!leavingHalt && target.counts_round && nextRound > maxRounds) {
+      const halted = fuseTarget(workflow.stages);
       fail(
         halted,
         "workflow_invalid",
-        "This workflow defines no halted stage, so the round fuse cannot stop rework.",
-        500,
+        "This workflow defines no halted stage an agent may enter, so the round fuse cannot stop rework. Add a halted stage with human_gate false.",
+        409,
       );
+      if (halted.human_gate)
+        fail(
+          actor.role === "human",
+          "human_gate_required",
+          `Stage "${halted.key}" needs a human decision on the board; the round fuse cannot place a card there.`,
+          403,
+          { stage: halted.key, human_gate: true },
+        );
       reason = `Round ${nextRound} exceeded max_rounds ${maxRounds}; the card was fused into ${halted.key}.`;
       stage = halted;
-      blocker = String(changes.blocker || card.blocker || "").trim() || reason;
+      // The fuse reason is always recorded; an earlier blocker stays behind it.
+      const prior = String(changes.blocker || card.blocker || "").trim();
+      blocker = prior && prior !== reason ? `${reason} ${prior}` : reason;
     }
     return {
       from: currentKey,
@@ -361,9 +423,10 @@ export class BoardStore {
       max_rounds: maxRounds,
       blocker,
       reason,
-      counts_round: Boolean(target.counts_round),
+      counts_round: Boolean(target.counts_round) && !leavingHalt,
       human_gate: Boolean(target.human_gate),
       fused: stage.key !== target.key,
+      recovered: leavingHalt && stage.key !== currentKey,
     };
   }
   /** One event per (card, revision); the unique index makes it idempotent. */
@@ -399,6 +462,7 @@ export class BoardStore {
       next_step: card.next_step || "",
       ...(plan.reason ? { reason: plan.reason } : {}),
       ...(plan.fused ? { fused: true } : {}),
+      ...(plan.entry ? { entry: plan.entry } : {}),
       at: now(),
     };
     const info = this.db
@@ -413,23 +477,52 @@ export class BoardStore {
       .run(JSON.stringify(event), seq);
     return event;
   }
+  /** Highest seq that was dropped by the retention window, 0 when none yet. */
+  eventsFloor() {
+    const raw = this.db
+      .prepare("SELECT value FROM metadata WHERE key='workflow_events_floor'")
+      .get()?.value;
+    const n = Number(raw);
+    return Number.isSafeInteger(n) && n >= 0 ? n : 0;
+  }
   workflowEvents({ after = 0, limit = 100, card_id = "" } = {}) {
     const boundedLimit = Math.max(
       1,
       Math.min(500, Number.isInteger(limit) ? limit : 100),
     );
     const cursor = Number.isInteger(after) && after >= 0 ? after : 0;
+    const oldest = this.db
+      .prepare("SELECT MIN(seq) AS s FROM workflow_events")
+      .get()?.s;
+    const retainedFrom = Number.isSafeInteger(oldest) ? oldest : null;
+    // A cursor behind the retention window would otherwise look like a clean
+    // continuation. Say so, and resume from the oldest event still stored.
+    const floor = this.eventsFloor();
+    const expired = retainedFrom !== null && cursor < retainedFrom - 1;
+    const start = expired ? Math.max(cursor, floor) : cursor;
     const rows = this.db
       .prepare(
         `SELECT seq, document FROM workflow_events WHERE seq > ?${card_id ? " AND card_id = ?" : ""} ORDER BY seq ASC LIMIT ?`,
       )
-      .all(cursor, ...(card_id ? [card_id] : []), boundedLimit + 1)
+      .all(start, ...(card_id ? [card_id] : []), boundedLimit + 1)
       .map((row) => decode(row));
     const events = rows.slice(0, boundedLimit);
     return {
       events,
-      next_cursor: events.length ? events[events.length - 1].seq : cursor,
+      next_cursor: events.length ? events[events.length - 1].seq : start,
       has_more: rows.length > boundedLimit,
+      oldest_seq: retainedFrom,
+      ...(expired
+        ? {
+            gap: {
+              after: cursor,
+              until: (retainedFrom ?? 1) - 1,
+              skipped: (retainedFrom ?? 1) - 1 - cursor,
+            },
+            resync:
+              "This cursor is older than the retained event window. Read GET /api/board for the current card state, then continue from next_cursor; the skipped transitions cannot be replayed.",
+          }
+        : {}),
     };
   }
   get(id, kind = "card") {
@@ -721,7 +814,9 @@ export class BoardStore {
         : workflow,
       announcements: this.announcements(),
       cards: cards.map((row) => {
-        const c = this.decorateCard(row, workflow);
+        // Each card is projected through its own project's definition, so the
+        // board and the card detail cannot disagree about stage or budget.
+        const c = this.decorateCard(row, this.workflow(row.project));
         const count = counts.get(c.id) || 0;
         if (!compact) return { ...c, comment_count: count };
         const summary = summarizeBody(c.body || "");
@@ -893,7 +988,13 @@ export class BoardStore {
     let stageKey = "";
     if (content.kind === "work") {
       const index = stageIndex(workflow.stages);
-      stageKey = content.stage || workflow.initial;
+      // An explicit stage wins; otherwise the coarse status picks the stage, so
+      // a card cannot be born on "initiated" while claiming it is done.
+      stageKey =
+        content.stage ||
+        (content.status === "planned"
+          ? workflow.initial
+          : defaultStageForStatus(workflow.stages, content.status));
       const stage = index.get(stageKey);
       fail(
         stage,
@@ -916,6 +1017,22 @@ export class BoardStore {
           403,
           { stage: stageKey, human_gate: true },
         );
+      // The coarse status always follows the stage that was actually chosen.
+      if (content.status !== stage.status) {
+        content.status = stage.status;
+        if (content.status === "blocked")
+          fail(
+            content.blocker,
+            "blocker_required",
+            "A blocked work card must explain blocker.",
+          );
+        if (content.status === "done")
+          fail(
+            content.body,
+            "result_required",
+            "A completed work card must describe the result in body.",
+          );
+      }
     }
     const cardPosition = newCardPosition(
       content.project,
@@ -985,6 +1102,44 @@ export class BoardStore {
         if (plan.blocker !== undefined) changes.blocker = plan.blocker;
       }
     }
+    // The original status entry point stays supported, but it must not leave a
+    // stored stage that contradicts the coarse status: a status-only edit also
+    // moves the stage and records the same transition event.
+    let statusPlan = null;
+    if (
+      card.kind === "work" &&
+      !plan &&
+      changes.stage === undefined &&
+      changes.status !== undefined
+    ) {
+      const wanted = String(changes.status).trim();
+      if (wanted && wanted !== card.status && storedStage) {
+        const index = stageIndex(workflow.stages);
+        const derived = defaultStageForStatus(workflow.stages, wanted);
+        const target = index.get(derived);
+        if (target && derived !== storedStage) {
+          changes.stage = derived;
+          changes.status = target.status;
+          statusPlan = {
+            from: storedStage,
+            requested: derived,
+            stage: target.key,
+            status: target.status,
+            category: target.category,
+            round:
+              Number.isSafeInteger(card.round) && card.round >= 1
+                ? card.round
+                : 1,
+            max_rounds: this.effectiveMaxRounds(card, workflow),
+            reason: "",
+            counts_round: false,
+            human_gate: Boolean(target.human_gate),
+            fused: false,
+            entry: "status",
+          };
+        }
+      }
+    }
     const content = withoutEmptyWorkflowFields(
       cardContent(changes, card),
       card,
@@ -1023,8 +1178,18 @@ export class BoardStore {
       revision: card.revision + 1,
     });
     this.save("card", next);
-    const transition = plan
-      ? this.recordTransition(next, actor, workflow, plan)
+    const chosen = plan || statusPlan;
+    // One event per real stage move; an edit that leaves the stage in place
+    // (a fused card asked to re-enter its own stage) records nothing.
+    const moved =
+      chosen &&
+      (chosen.stage !== storedStage ||
+        chosen.round !==
+          (Number.isSafeInteger(card.round) && card.round >= 1
+            ? card.round
+            : 1));
+    const transition = moved
+      ? this.recordTransition(next, actor, workflow, chosen)
       : null;
     return {
       action: "card.updated",
@@ -1582,6 +1747,17 @@ export class BoardStore {
       this.db.exec(
         "DELETE FROM workflow_events WHERE seq NOT IN (SELECT seq FROM workflow_events ORDER BY seq DESC LIMIT 5000)",
       );
+      // Remember the last seq the window dropped so a late consumer is told
+      // its cursor expired instead of silently resuming with a hole.
+      const retained = this.db
+        .prepare("SELECT MIN(seq) AS s FROM workflow_events")
+        .get()?.s;
+      if (Number.isSafeInteger(retained) && retained - 1 > this.eventsFloor())
+        this.db
+          .prepare(
+            "INSERT INTO metadata(key,value) VALUES('workflow_events_floor',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+          )
+          .run(String(retained - 1));
       this.db.exec("COMMIT");
     } catch (error) {
       this.db.exec("ROLLBACK");

@@ -289,11 +289,20 @@ export function validateStages(input) {
   return stages;
 }
 
+function requireFuseTarget(stages, scope) {
+  fail(
+    fuseTarget(stages),
+    "invalid_workflow",
+    `${scope}needs a halted stage an agent may enter (category "halted" with human_gate false); the round fuse sends cards there when the rework budget runs out. Marking the only halted stage as human_gate:true would leave the fuse nowhere to stop.`,
+  );
+}
+
 export function validateWorkflow(
   input,
   { initial, max_rounds, projects } = {},
 ) {
   const stages = validateStages(input?.stages ?? input);
+  requireFuseTarget(stages, "This workflow ");
   const keys = new Set(stages.map((s) => s.key));
   const initialKey = text(
     initial ?? input?.initial ?? "initiated",
@@ -336,6 +345,8 @@ export function validateWorkflow(
     const projectStages = override.stages
       ? validateStages(override.stages)
       : stages;
+    if (override.stages)
+      requireFuseTarget(projectStages, `projects["${name}"] `);
     const projectRounds = coerceRounds(override.max_rounds);
     const projectInitial = override.initial
       ? text(
@@ -408,6 +419,19 @@ export function resolveWorkflow(stored, project = "") {
 
 export function stageIndex(stages) {
   return new Map(stages.map((stage) => [stage.key, stage]));
+}
+
+/**
+ * The stage that receives a card whose rework budget ran out.
+ * It is configuration, not a fixed key: any live halted stage an agent may
+ * enter serves. A halted stage behind a human gate cannot be entered
+ * automatically, so it never takes that role.
+ */
+export function fuseTarget(stages) {
+  return (
+    stages.find((s) => s.category === "halted" && !s.deprecated && !s.human_gate) ||
+    null
+  );
 }
 
 // Legacy cards only carry the coarse status; map it to the closest stage.

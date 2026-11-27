@@ -304,11 +304,21 @@ export const GUIDE = {
     stages:
       "Each stage has key, label, label_en, category (active|halted|terminal), status (planned|in_progress|blocked|done), allowed_next, human_gate, counts_round and deprecated. A card stores only stage and round; labels are resolved on read, so relabelling is hot.",
     rounds:
-      "max_rounds resolves card → project → global. Entering a stage with counts_round:true spends one round. When the next round would exceed the budget the card is fused into the halted stage (blocked) with the reason written into blocker.",
+      "max_rounds resolves card → project → global. Entering a stage with counts_round:true spends one round. When the next round would exceed the budget the card is fused into the workflow's fuse stage, the first non-deprecated halted stage with human_gate:false, and the reason is written into blocker. A max_rounds sent in the same PATCH is the budget used for that move, including an explicit clear (\"\"), which falls back to the workflow budget. Leaving a halted stage spends no round and is never fused back.",
     human_gate:
       "A stage with human_gate:true only accepts a human board owner actor. Agents must stop and ask; they cannot promote merged or deployed themselves.",
+    fuse_stage:
+      "Every resolved workflow must keep at least one halted stage that agents may enter; PUT /api/workflow rejects a definition that removes it or puts it behind human_gate, because the round fuse would have nowhere to stop.",
+    project_edits:
+      "A project override is edited field by field: PUT /api/workflow with only max_rounds keeps the project's own stages and initial. A definition that would strand an existing live card (its stage disappears, or a non-terminal stage loses every next stage) is rejected with workflow_strands_cards.",
+    status_entry:
+      "stage is the precise state; status is its coarse family. Creating a card on a stage sets the matching status, and a status-only PATCH moves the card to that status' stage, so a saved card never shows a stage and a status that contradict each other. Both entry points record the same transition event.",
     events:
-      "Every accepted stage change appends one event keyed by (card_id, revision) with a monotonic seq. Poll GET /api/workflow/events?after=<seq> for stable consumption; replays of the same revision never duplicate an event.",
+      "Every accepted stage move appends one event keyed by (card_id, revision) with a monotonic seq: a stage change through PATCH stage, a status-only edit that moves the stage, or an automatic fuse. An edit that leaves the stage in place records nothing. Poll GET /api/workflow/events?after=<seq> for stable consumption; replays of the same revision never duplicate an event.",
+    event_retention:
+      "The feed keeps the newest 5000 events. A cursor older than the retained window is answered with a gap block (after, until, skipped) and a resync instruction instead of a silent hole: read GET /api/board for current state, then continue from next_cursor. oldest_seq in every response is the oldest event still stored.",
+    read_access:
+      "GET /api/workflow and GET /api/workflow/events sit behind the same identity check as /api/board: key mode answers 401 without a key, lan mode accepts the shared identity.",
     legacy:
       "Cards created before this feature have no stage. They stay readable: their stage is derived from status (planned→initial, in_progress→working, blocked→blocked, done→completed) and is only written once someone actually moves them.",
   },

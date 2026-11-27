@@ -1,4 +1,4 @@
-import test from "node:test";
+﻿import test from "node:test";
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
 import { fixture, work, ADMIN } from "./helpers.mjs";
@@ -529,4 +529,330 @@ test("snapshot and card directory expose the resolved stage display fields", asy
   assert.equal(listed.stage, "initiated");
   assert.equal(listed.rounds_remaining, 2);
   assert.equal(listed.head_sha, "abcdef1234567");
+});
+
+// ---------------------------------------------------------------------------
+// Review round 2: the seven blocking findings.
+// ---------------------------------------------------------------------------
+
+const stagesNow = async (f, project = "") =>
+  (await f.call(`/api/workflow${project ? `?project=${encodeURIComponent(project)}` : ""}`))
+    .body.workflow;
+const putWorkflow = async (f, body) =>
+  f.call("/api/workflow", { method: "PUT", body });
+const versionNow = async (f) => (await f.call("/api/workflow")).body.workflow.version;
+
+test("workflow reads need the same identity as the board in key and lan mode", async (t) => {
+  const keyed = await fixture();
+  t.after(() => keyed.close());
+  const anon = await keyed.call("/api/workflow", { token: "" });
+  assert.equal(anon.status, 401);
+  assert.equal(anon.body.error.code, "unauthorized");
+  assert.equal((await keyed.call("/api/workflow/events", { token: "" })).status, 401);
+  assert.equal((await keyed.call("/api/board", { token: "" })).status, 401);
+  assert.equal((await keyed.call("/api/workflow")).status, 200);
+
+  const lan = await fixture({ accessMode: "lan" });
+  t.after(() => lan.close());
+  assert.equal((await lan.call("/api/workflow", { token: "" })).status, 200);
+  assert.equal(
+    (await lan.call("/api/workflow/events", { token: "" })).status,
+    200,
+  );
+});
+
+test("editing only a project budget keeps the project stages and initial", async (t) => {
+  const f = await fixture();
+  t.after(() => f.close());
+  const base = await stagesNow(f);
+  const stages = [
+    ...base.stages,
+    {
+      key: "project_start",
+      label: "项目起点",
+      label_en: "Project start",
+      category: "active",
+      status: "planned",
+      allowed_next: ["working"],
+      human_gate: false,
+      counts_round: false,
+    },
+  ];
+  const first = await putWorkflow(f, {
+    expected_version: base.version,
+    project: "phase2",
+    stages,
+    initial: "project_start",
+    max_rounds: 5,
+  });
+  assert.equal(first.status, 200, JSON.stringify(first.body));
+
+  const created = await f.call("/api/cards", {
+    method: "POST",
+    body: await f.work("workflow/project-start", { project: "phase2" }),
+  });
+  assert.equal(created.body.card.stage, "project_start", JSON.stringify(created.body));
+
+  // A later budget-only edit must not drop the override's own stages/initial.
+  const second = await putWorkflow(f, {
+    expected_version: await versionNow(f),
+    project: "phase2",
+    max_rounds: 2,
+  });
+  assert.equal(second.status, 200, JSON.stringify(second.body));
+  const resolved = await stagesNow(f, "phase2");
+  assert.equal(resolved.scope, "project");
+  assert.equal(resolved.initial, "project_start");
+  assert.equal(resolved.max_rounds, 2);
+  assert.ok(resolved.stages.some((s) => s.key === "project_start"));
+
+  const moved = await patch(f, created.body.card.id, ADMIN, { stage: "working" });
+  assert.equal(moved.status, 200, JSON.stringify(moved.body));
+  assert.equal(moved.body.card.stage, "working");
+});
+
+test("a definition that would strand an existing card is rejected", async (t) => {
+  const f = await fixture();
+  t.after(() => f.close());
+  const created = await createWork(f, "workflow/stranded");
+  const id = created.body.card.id;
+  await patch(f, id, ADMIN, { stage: "claimed" });
+
+  const stages = (await stagesNow(f)).stages
+    .filter((s) => s.key !== "claimed")
+    .map((s) => ({
+      ...s,
+      allowed_next: s.allowed_next.filter((n) => n !== "claimed"),
+    }));
+  const res = await putWorkflow(f, {
+    expected_version: await versionNow(f),
+    stages,
+  });
+  assert.equal(res.status, 409);
+  assert.equal(res.body.error.code, "workflow_strands_cards");
+  assert.match(res.body.error.message, /claimed/);
+
+  // The stored definition is untouched, so the card still moves.
+  const moved = await patch(f, id, ADMIN, { stage: "working" });
+  assert.equal(moved.status, 200, JSON.stringify(moved.body));
+});
+
+test("the board and the card detail agree on a project-specific stage and budget", async (t) => {
+  const f = await fixture();
+  t.after(() => f.close());
+  const base = await stagesNow(f);
+  const stages = [
+    ...base.stages,
+    {
+      key: "project_start",
+      label: "项目起点",
+      label_en: "Project start",
+      category: "active",
+      status: "planned",
+      allowed_next: ["working"],
+      human_gate: false,
+      counts_round: false,
+    },
+  ];
+  const put = await putWorkflow(f, {
+    expected_version: base.version,
+    project: "phase2",
+    stages,
+    initial: "project_start",
+    max_rounds: 5,
+  });
+  assert.equal(put.status, 200, JSON.stringify(put.body));
+  const created = await f.call("/api/cards", {
+    method: "POST",
+    body: await f.work("workflow/projection-phase2", { project: "phase2" }),
+  });
+  const id = created.body.card.id;
+
+  const unfiltered = await f.call("/api/board");
+  const onBoard = unfiltered.body.cards.find((c) => c.id === id);
+  const detail = await f.call(`/api/cards/${id}`);
+  assert.equal(onBoard.stage, "project_start");
+  assert.equal(onBoard.max_rounds, 5);
+  assert.equal(onBoard.stage, detail.body.card.stage);
+  assert.equal(onBoard.max_rounds, detail.body.card.max_rounds);
+
+  // Relabelling is visible on the board without rewriting the card.
+  const relabelled = stages.map((s) =>
+    s.key === "project_start" ? { ...s, label: "项目开始" } : s,
+  );
+  const edit = await putWorkflow(f, {
+    expected_version: await versionNow(f),
+    project: "phase2",
+    stages: relabelled,
+    initial: "project_start",
+  });
+  assert.equal(edit.status, 200, JSON.stringify(edit.body));
+  const after = await f.call("/api/board");
+  assert.equal(
+    after.body.cards.find((c) => c.id === id).stage_label,
+    "项目开始",
+  );
+});
+
+test("the fuse lands on the configured halted stage and the definition must keep one", async (t) => {
+  const f = await fixture();
+  t.after(() => f.close());
+  const base = await stagesNow(f);
+
+  const gated = base.stages.map((s) =>
+    s.key === "blocked" ? { ...s, human_gate: true } : s,
+  );
+  const refused = await putWorkflow(f, {
+    expected_version: base.version,
+    stages: gated,
+  });
+  assert.equal(refused.status, 400);
+  assert.equal(refused.body.error.code, "invalid_workflow");
+  assert.match(refused.body.error.message, /halted/);
+
+  const renamed = base.stages.map((s) => ({
+    ...(s.key === "blocked"
+      ? { ...s, key: "paused", label: "已暂停", label_en: "Paused" }
+      : s),
+    allowed_next: s.allowed_next.map((n) => (n === "blocked" ? "paused" : n)),
+  }));
+  const put = await putWorkflow(f, {
+    expected_version: await versionNow(f),
+    stages: renamed,
+    max_rounds: 1,
+  });
+  assert.equal(put.status, 200, JSON.stringify(put.body));
+
+  const created = await createWork(f, "workflow/fuse-target");
+  const id = created.body.card.id;
+  await patch(f, id, ADMIN, { stage: "claimed" });
+  await patch(f, id, ADMIN, { stage: "working" });
+  await patch(f, id, ADMIN, { stage: "in_review" });
+  const fused = await patch(f, id, ADMIN, { stage: "changes_requested" });
+  assert.equal(fused.status, 200, JSON.stringify(fused.body));
+  assert.equal(fused.body.card.stage, "paused");
+  assert.equal(fused.body.card.status, "blocked");
+  assert.equal(fused.body.transition.fused, true);
+  assert.match(fused.body.card.blocker, /paused/);
+});
+
+test("a budget cleared in the same edit is already in force, and the fuse reason survives", async (t) => {
+  const f = await fixture();
+  t.after(() => f.close());
+  const created = await createWork(f, "workflow/budget-edit", { max_rounds: 1 });
+  const id = created.body.card.id;
+  assert.equal(created.body.card.max_rounds, 1);
+  await patch(f, id, ADMIN, { stage: "claimed" });
+  await patch(f, id, ADMIN, { stage: "working" });
+  await patch(f, id, ADMIN, { stage: "in_review", blocker: "waiting on vendor" });
+
+  // Clearing the card budget inherits the workflow's 3 in this very move.
+  const moved = await patch(f, id, ADMIN, {
+    stage: "changes_requested",
+    max_rounds: "",
+  });
+  assert.equal(moved.status, 200, JSON.stringify(moved.body));
+  assert.equal(moved.body.card.stage, "changes_requested");
+  assert.equal(moved.body.card.round, 2);
+  assert.equal(moved.body.card.max_rounds, 3);
+  assert.equal(moved.body.transition.fused, undefined);
+
+  // Now fuse for real: a single round budget with an existing blocker.
+  await patch(f, id, ADMIN, { max_rounds: 1 });
+  await patch(f, id, ADMIN, { stage: "working" });
+  await patch(f, id, ADMIN, { stage: "in_review" });
+  const fused = await patch(f, id, ADMIN, { stage: "changes_requested" });
+  assert.equal(fused.status, 200, JSON.stringify(fused.body));
+  assert.equal(fused.body.card.stage, "blocked");
+  assert.match(fused.body.card.blocker, /exceeded max_rounds 1/);
+  assert.match(fused.body.card.blocker, /waiting on vendor/);
+});
+
+test("a fused card can leave the halted stage without another round or a self-transition", async (t) => {
+  const f = await fixture();
+  t.after(() => f.close());
+  const created = await createWork(f, "workflow/fuse-exit", { max_rounds: 1 });
+  const id = created.body.card.id;
+  await patch(f, id, ADMIN, { stage: "claimed" });
+  await patch(f, id, ADMIN, { stage: "working" });
+  await patch(f, id, ADMIN, { stage: "in_review" });
+  const fused = await patch(f, id, ADMIN, { stage: "changes_requested" });
+  assert.equal(fused.body.card.stage, "blocked");
+  const round = fused.body.card.round;
+
+  const left = await patch(f, id, ADMIN, { stage: "archived", body: "wrapped up" });
+  assert.equal(left.status, 200, JSON.stringify(left.body));
+  assert.equal(left.body.card.stage, "archived");
+  assert.equal(left.body.card.round, round);
+  assert.equal(left.body.transition.from_stage, "blocked");
+  assert.equal(left.body.transition.to_stage, "archived");
+
+  const events = await f.call(`/api/workflow/events?card_id=${id}`);
+  assert.equal(
+    events.body.events.filter(
+      (e) => e.from_stage === "blocked" && e.to_stage === "blocked",
+    ).length,
+    0,
+  );
+});
+
+test("stage and coarse status never contradict each other on save", async (t) => {
+  const f = await fixture();
+  t.after(() => f.close());
+
+  const done = await createWork(f, "workflow/status-done", {
+    status: "done",
+    body: "result recorded",
+  });
+  assert.equal(done.status, 200, JSON.stringify(done.body));
+  assert.equal(done.body.card.stage, "completed");
+  assert.equal(done.body.card.status, "done");
+
+  const working = await createWork(f, "workflow/status-working", {
+    stage: "working",
+  });
+  assert.equal(working.body.card.stage, "working");
+  assert.equal(working.body.card.status, "in_progress");
+
+  const id = working.body.card.id;
+  const blocked = await patch(f, id, ADMIN, {
+    status: "blocked",
+    blocker: "operator unavailable",
+  });
+  assert.equal(blocked.status, 200, JSON.stringify(blocked.body));
+  assert.equal(blocked.body.card.stage, "blocked");
+  assert.equal(blocked.body.card.status, "blocked");
+  assert.equal(blocked.body.transition.from_stage, "working");
+  assert.equal(blocked.body.transition.entry, "status");
+
+  const detail = await f.call(`/api/cards/${id}`);
+  assert.equal(detail.body.card.stage, "blocked");
+  assert.equal(detail.body.card.status, "blocked");
+});
+
+test("a cursor behind the retained event window is told it expired", async (t) => {
+  const f = await fixture();
+  t.after(() => f.close());
+  const db = f.store.db;
+  const insert = db.prepare(
+    "INSERT INTO workflow_events(card_id,revision,document) VALUES(?,?,?)",
+  );
+  for (let i = 1; i <= 5003; i++)
+    insert.run("synthetic", i, JSON.stringify({ seq: i, card_id: "synthetic", revision: i }));
+
+  f.store.prune(Date.now());
+
+  const resumed = await f.call("/api/workflow/events?after=0");
+  assert.equal(resumed.status, 200);
+  assert.ok(resumed.body.gap, "an expired cursor must be reported as a gap");
+  assert.equal(resumed.body.gap.after, 0);
+  assert.equal(resumed.body.gap.until, 3);
+  assert.equal(resumed.body.gap.skipped, 3);
+  assert.match(resumed.body.resync, /api\/board/);
+  assert.equal(resumed.body.oldest_seq, 4);
+  assert.equal(resumed.body.events[0].seq, 4);
+
+  const fresh = await f.call("/api/workflow/events?after=3");
+  assert.equal(fresh.body.gap, undefined);
+  assert.equal(fresh.body.events[0].seq, 4);
 });

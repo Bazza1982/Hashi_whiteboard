@@ -105,23 +105,6 @@ export function createApp({
     res.json({ ok: true, product: "HASHI Whiteboard", version: "0.1.0" }),
   );
   app.get("/api/guide", (_req, res) => res.json({ ...GUIDE, access }));
-  app.get("/api/workflow", (req, res) =>
-    res.json({
-      workflow: store.workflow(String(req.query.project || "")),
-      defaults: store.workflow("").projects,
-    }),
-  );
-  app.get("/api/workflow/events", (req, res) => {
-    const after = Number.parseInt(String(req.query.after ?? "0"), 10);
-    const limit = Number.parseInt(String(req.query.limit ?? "100"), 10);
-    res.json(
-      store.workflowEvents({
-        after: Number.isFinite(after) ? after : 0,
-        limit: Number.isFinite(limit) ? limit : 100,
-        card_id: String(req.query.card_id || ""),
-      }),
-    );
-  });
   const actorFor = (req) => {
     const authorization = req.get("authorization");
     if (authorization)
@@ -197,6 +180,26 @@ export function createApp({
     if (raw) sessions.delete(hash(raw));
     res.clearCookie("whiteboard_session", { path: "/" });
     res.json({ ok: true });
+  });
+  // The stage definition and the transition feed describe live cards, so they
+  // sit behind the same identity check as the board itself. In lan mode the
+  // shared identity satisfies it; in key mode an unkeyed caller gets 401.
+  app.get("/api/workflow", (req, res) =>
+    res.json({
+      workflow: store.workflow(String(req.query.project || "")),
+      defaults: store.workflow("").projects,
+    }),
+  );
+  app.get("/api/workflow/events", (req, res) => {
+    const after = Number.parseInt(String(req.query.after ?? "0"), 10);
+    const limit = Number.parseInt(String(req.query.limit ?? "100"), 10);
+    res.json(
+      store.workflowEvents({
+        after: Number.isFinite(after) ? after : 0,
+        limit: Number.isFinite(limit) ? limit : 100,
+        card_id: String(req.query.card_id || ""),
+      }),
+    );
   });
   app.get("/api/me", (req, res) => res.json({ actor: req.actor, access }));
   app.get("/api/connection", (req, res) => {

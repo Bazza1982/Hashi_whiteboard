@@ -144,6 +144,9 @@ team's process. Both are readable on every card; only `stage` is new.
 
 ### Reading
 
+Both workflow reads sit behind the same identity check as `/api/board`: in key
+mode an unkeyed request gets `401`, in lan mode the shared identity answers.
+
 `GET /api/workflow?project=<name>` returns the resolved definition:
 
 - `initial` – the stage a new work card starts on
@@ -176,14 +179,43 @@ PATCH /api/cards/:id
   the human board owner. Agents must stop and ask; this is not a hint.
 - Entering a stage with `counts_round: true` (`changes_requested`) spends one
   round. When the next round would exceed the budget the card is fused into the
-  halted stage and the reason is written into `blocker`; the response carries
-  `transition.fused` and `transition.reason`.
+  workflow's fuse stage and the reason is written into `blocker`; the response
+  carries `transition.fused` and `transition.reason`.
+
+### Stage and status must agree
+
+`stage` is the precise state and `status` is its coarse family (`active` stages
+are `planned`/`in_progress`, `halted` is `blocked`, `terminal` is `done`). The
+server keeps them consistent on every save:
+
+- creating a card on a stage stores that stage's coarse status, and creating one
+  with only a `status` picks the matching stage;
+- a status-only `PATCH` (the pre-existing entry point) also moves the stage to
+  that status' stage, so a card never stays on `working` while claiming
+  `blocked`;
+- both entry points write the same transition event. An edit that leaves the
+  stage where it is writes none.
+
+### The fuse stage
+
+Every resolved workflow must keep one halted stage that agents may enter: the
+first non-deprecated `category: "halted"` stage with `human_gate: false`. It is
+where the round fuse lands, so `PUT /api/workflow` rejects a definition that
+removes it or puts it behind a human gate. Marking the only halted stage
+`human_gate: true` would leave the fuse nowhere to stop.
+
+Leaving a halted stage is a recovery, not new rework: it spends no round and is
+never fused straight back, so `blocked → archived` completes normally.
 
 ### Budget precedence
 
 `max_rounds` resolves card → project → global. Set it on one card for an
 unusually long review, on a project for a stricter process, or globally for the
 whole board. Empty means inherit.
+
+A `max_rounds` sent in the same `PATCH` as the stage move is the budget used for
+that move, including an explicit clear (`""`), which falls back to the workflow
+budget rather than to the card's previous value.
 
 ### Events for automation
 
@@ -196,7 +228,14 @@ Each event carries `event_id`, `card_id`, `work_key`, `project`, `revision`,
 `from_stage`, `to_stage`, `category`, `round`, `max_rounds`, `actor`,
 `implementer`, `reviewer`, `tester`, `pr_url`, `head_sha`, `last_verdict`,
 `test_env`, `next_step`, plus `requested_stage`, `reason` and `fused` when the
-round fuse fired. Replaying an idempotent write never produces a second event.
+round fuse fired, and `entry: "status"` when a status-only edit moved the stage.
+Replaying an idempotent write never produces a second event.
+
+The feed keeps the newest 5000 events. Every response carries `oldest_seq`. A
+cursor older than the retained window is answered with a `gap` block
+(`after`, `until`, `skipped`) plus a `resync` instruction instead of a silent
+hole: read `GET /api/board` for current state, then continue from
+`next_cursor`. The skipped transitions cannot be replayed.
 
 ### Changing the definition
 
@@ -215,7 +254,14 @@ PUT /api/workflow
 `409 workflow_conflict` with the current definition. `reset: true` drops a
 project override, or restores the built-in template when no project is given.
 Stages are validated as a graph: unique keys, known `allowed_next` targets,
-category-consistent status values.
+category-consistent status values, and a halted fuse stage agents may enter.
+
+A project override is edited field by field. Sending only `max_rounds` keeps
+that project's own `stages` and `initial`; send `""` for a field to drop it and
+inherit the global value. A definition that would strand an existing live card —
+its stage disappears, or a non-terminal stage loses every next stage — is
+rejected with `409 workflow_strands_cards` naming the cards, so an edit cannot
+leave a card that can never move again.
 
 ### Legacy cards
 
