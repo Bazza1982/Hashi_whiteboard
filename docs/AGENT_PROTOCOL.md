@@ -136,6 +136,93 @@ Every mutation requires a unique `Idempotency-Key` header. MCP/CLI calls instead
 
 Server error messages and returned current state are part of the agent contract. Read them; do not assume success on timeout or failure.
 
+## Configurable workflow stages
+
+The coarse `status` field still decides whether a card is planned, in progress,
+blocked or done. A second, optional layer describes _where_ the card sits in the
+team's process. Both are readable on every card; only `stage` is new.
+
+### Reading
+
+`GET /api/workflow?project=<name>` returns the resolved definition:
+
+- `initial` – the stage a new work card starts on
+- `max_rounds` – the default review budget
+- `stages[]` – `key`, `label`, `label_en`, `category`
+  (`active` / `halted` / `terminal`), `status`, `allowed_next`, `human_gate`,
+  `counts_round`, `deprecated`
+- `scope` – `global` or `project`, so you know which layer answered
+
+Card reads, the directory and the snapshot add `stage`, `stage_label`,
+`stage_category`, `round`, `max_rounds` and `rounds_remaining`. Labels come from
+the configuration at read time, so a relabel is immediately visible everywhere.
+
+### Moving a card
+
+Send the target stage in a normal content update:
+
+```json
+PATCH /api/cards/:id
+{"expected_revision": 7, "changes": {"stage": "in_review", "head_sha": "1f385934"}}
+```
+
+- Only `allowed_next` transitions are accepted; anything else returns
+  `409 invalid_transition` with the allowed list.
+- Unknown keys return `400 unknown_stage`; deprecated stages return
+  `409 stage_deprecated`. Deprecated stages stay readable on existing cards and
+  can still be left.
+- `blocked` still requires `blocker`, `done` still requires a recorded result.
+- A stage with `human_gate: true` (default: `merged`, `deployed`) only accepts
+  the human board owner. Agents must stop and ask; this is not a hint.
+- Entering a stage with `counts_round: true` (`changes_requested`) spends one
+  round. When the next round would exceed the budget the card is fused into the
+  halted stage and the reason is written into `blocker`; the response carries
+  `transition.fused` and `transition.reason`.
+
+### Budget precedence
+
+`max_rounds` resolves card → project → global. Set it on one card for an
+unusually long review, on a project for a stricter process, or globally for the
+whole board. Empty means inherit.
+
+### Events for automation
+
+Every accepted stage change appends one event, keyed by `(card_id, revision)`
+with a monotonic `seq`:
+
+`GET /api/workflow/events?after=<seq>&limit=100&card_id=<id>`
+
+Each event carries `event_id`, `card_id`, `work_key`, `project`, `revision`,
+`from_stage`, `to_stage`, `category`, `round`, `max_rounds`, `actor`,
+`implementer`, `reviewer`, `tester`, `pr_url`, `head_sha`, `last_verdict`,
+`test_env`, `next_step`, plus `requested_stage`, `reason` and `fused` when the
+round fuse fired. Replaying an idempotent write never produces a second event.
+
+### Changing the definition
+
+Only the human owner may edit it:
+
+```json
+PUT /api/workflow
+{"expected_version": 3, "max_rounds": 4}
+PUT /api/workflow
+{"expected_version": 4, "project": "Hashi", "max_rounds": 2}
+PUT /api/workflow
+{"expected_version": 5, "stages": [ ...full stage list... ]}
+```
+
+`expected_version` is optimistic locking: a stale value returns
+`409 workflow_conflict` with the current definition. `reset: true` drops a
+project override, or restores the built-in template when no project is given.
+Stages are validated as a graph: unique keys, known `allowed_next` targets,
+category-consistent status values.
+
+### Legacy cards
+
+Cards created before this feature carry no `stage`. Their stage is derived from
+`status` (`planned→initiated`, `in_progress→working`, `blocked→blocked`,
+`done→completed`) and nothing is written until someone actually moves them.
+
 ## CLI
 
 ```text

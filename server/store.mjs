@@ -11,10 +11,19 @@ import {
   version,
   position,
   CARD_FIELDS,
+  WORKFLOW_FIELDS,
 } from "../shared/contract.mjs";
 import { newCardPosition } from "../shared/layout.mjs";
 import { relationOf, validateConnection } from "../shared/relations.mjs";
 import { tidyProjects } from "../shared/tidy.mjs";
+import {
+  DEFAULT_WORKFLOW,
+  resolveWorkflow,
+  validateWorkflow,
+  normalizeWorkflow,
+  stageIndex,
+  defaultStageForStatus,
+} from "../shared/workflow.mjs";
 
 export const hash = (value) => createHash("sha256").update(value).digest("hex");
 const now = () => new Date().toISOString();
@@ -43,6 +52,20 @@ function summarizeBody(fullBody = "") {
     body_preview: previewSource.slice(0, 240),
     body_length: String(fullBody || "").length,
   };
+}
+
+// Empty workflow fields are inherited, not stored. Keep cards that never used
+// the feature free of the new keys so an unrelated edit stays a content edit.
+function withoutEmptyWorkflowFields(content, existing = null) {
+  for (const key of WORKFLOW_FIELDS) {
+    const empty = content[key] === "" || content[key] === null;
+    const wasEmpty =
+      existing?.[key] === undefined ||
+      existing?.[key] === "" ||
+      existing?.[key] === null;
+    if (empty && wasEmpty) delete content[key];
+  }
+  return content;
 }
 
 function applyUpdatedBy(card, actor, patch = {}) {
@@ -74,6 +97,9 @@ export class BoardStore {
       CREATE TABLE IF NOT EXISTS assets (id TEXT PRIMARY KEY, mime TEXT NOT NULL, body BLOB NOT NULL, created_at TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS layouts (id TEXT PRIMARY KEY, document TEXT NOT NULL);
+      CREATE TABLE IF NOT EXISTS workflow_events (seq INTEGER PRIMARY KEY AUTOINCREMENT, card_id TEXT NOT NULL, revision INTEGER NOT NULL, document TEXT NOT NULL);
+      CREATE UNIQUE INDEX IF NOT EXISTS workflow_events_card_revision ON workflow_events(card_id, revision);
+      CREATE INDEX IF NOT EXISTS workflow_events_card_idx ON workflow_events(card_id);
       INSERT OR IGNORE INTO metadata VALUES('revision','0');`);
     this.db
       .prepare(
@@ -116,6 +142,295 @@ export class BoardStore {
       this.db.prepare("SELECT value FROM metadata WHERE key='revision'").get()
         .value,
     );
+  }
+  workflowMemo() {
+    const value =
+      this.db.prepare("SELECT value FROM metadata WHERE key='workflow'").get()
+        ?.value || "";
+    if (this._wfValue !== value) {
+      let stored = null;
+      if (value) {
+        try {
+          stored = JSON.parse(value);
+        } catch {
+          stored = null;
+        }
+      }
+      this._wfValue = value;
+      this._wfBase = normalizeWorkflow(stored);
+      this._wfCache = new Map();
+    }
+    return this._wfBase;
+  }
+  /** Resolved workflow for a project: global template merged with its override. */
+  workflow(project = "") {
+    const base = this.workflowMemo();
+    const key = `${this._wfValue}\u0000${project}`;
+    let resolved = this._wfCache.get(key);
+    if (!resolved) {
+      resolved = resolveWorkflow(base, project);
+      if (this._wfCache.size > 64) this._wfCache.clear();
+      this._wfCache.set(key, resolved);
+    }
+    return resolved;
+  }
+  effectiveMaxRounds(card, workflow, incoming) {
+    const pick = (value) => {
+      if (value === undefined || value === null || value === "") return null;
+      const n =
+        typeof value === "number"
+          ? value
+          : Number.parseInt(String(value).trim(), 10);
+      return Number.isSafeInteger(n) && n >= 1 ? n : null;
+    };
+    return pick(incoming) ?? pick(card?.max_rounds) ?? workflow.max_rounds;
+  }
+  /** Add derived stage display fields without rewriting the stored card. */
+  decorateCard(card, workflow) {
+    if (!card || card.kind !== "work") return card;
+    const index = stageIndex(workflow.stages);
+    const key =
+      card.stage && index.has(card.stage)
+        ? card.stage
+        : defaultStageForStatus(workflow.stages, card.status);
+    const stage = index.get(key);
+    const round =
+      Number.isSafeInteger(card.round) && card.round >= 1 ? card.round : 1;
+    const maxRounds = this.effectiveMaxRounds(card, workflow);
+    return {
+      ...card,
+      stage: key,
+      stage_label: stage?.label || key,
+      stage_label_en: stage?.label_en || "",
+      stage_category: stage?.category || "active",
+      stage_deprecated: Boolean(stage?.deprecated),
+      round,
+      max_rounds: maxRounds,
+      rounds_remaining: Math.max(0, maxRounds - round),
+    };
+  }
+  updateWorkflow(actor, data) {
+    fail(
+      actor.role === "human",
+      "admin_required",
+      "Only the human board owner can change the workflow definition.",
+      403,
+    );
+    exactKeys(data, [
+      "expected_version",
+      "project",
+      "stages",
+      "max_rounds",
+      "initial",
+      "reset",
+    ]);
+    const base = this.workflow("");
+    fail(
+      Number.isSafeInteger(data.expected_version),
+      "version_required",
+      "expected_version must be the integer returned by GET /api/workflow.",
+    );
+    fail(
+      base.version === data.expected_version,
+      "workflow_conflict",
+      "The workflow changed. Read GET /api/workflow, compare, then edit deliberately.",
+      409,
+      { current: base },
+    );
+    const project = String(data.project || "").trim();
+    fail(
+      project.length <= 2000,
+      "invalid_workflow",
+      "project must be at most 2000 characters.",
+    );
+    const stored = this.workflowMemo();
+    let document;
+    if (project) {
+      const projects = { ...stored.projects };
+      if (data.reset === true) delete projects[project];
+      else {
+        const override = {};
+        if (data.stages !== undefined) override.stages = data.stages;
+        if (data.max_rounds !== undefined)
+          override.max_rounds = data.max_rounds;
+        if (data.initial !== undefined) override.initial = data.initial;
+        fail(
+          Object.keys(override).length,
+          "empty_changes",
+          `Supply stages, max_rounds or initial for project "${project}", or reset:true to drop its override.`,
+        );
+        projects[project] = override;
+      }
+      document = { ...stored, projects, version: stored.version + 1 };
+    } else if (data.reset === true) {
+      document = { ...DEFAULT_WORKFLOW, version: stored.version + 1 };
+    } else {
+      document = {
+        ...stored,
+        initial: data.initial ?? stored.initial,
+        max_rounds: data.max_rounds ?? stored.max_rounds,
+        stages: data.stages ?? stored.stages,
+        version: stored.version + 1,
+      };
+    }
+    const validated = validateWorkflow(document);
+    this.db
+      .prepare(
+        "INSERT INTO metadata(key,value) VALUES('workflow',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+      )
+      .run(JSON.stringify(validated));
+    this._wfValue = undefined;
+    this._wfCache = null;
+    return {
+      action: "workflow.updated",
+      workflow: this.workflow(project),
+      version: validated.version,
+    };
+  }
+  /** Validate a stage change, spend a review round and fuse over-long rework. */
+  planTransition({ actor, card, workflow, from, to, changes }) {
+    const index = stageIndex(workflow.stages);
+    const target = index.get(to);
+    fail(
+      target,
+      "unknown_stage",
+      `Unknown stage "${to}". Read GET /api/workflow for this project's stages.`,
+      400,
+      { stages: workflow.stages.map((stage) => stage.key) },
+    );
+    const currentKey =
+      from || defaultStageForStatus(workflow.stages, card.status);
+    const current = index.get(currentKey);
+    fail(
+      current,
+      "unknown_stage",
+      `This card sits on stage "${currentKey}", which the current workflow does not define.`,
+      409,
+    );
+    fail(
+      !target.deprecated,
+      "stage_deprecated",
+      `Stage "${to}" is deprecated and cannot be entered.`,
+      409,
+    );
+    fail(
+      current.allowed_next.includes(to),
+      "invalid_transition",
+      `Stage "${currentKey}" cannot move to "${to}". Allowed next: ${current.allowed_next.join(", ") || "none"}.`,
+      409,
+      { from: currentKey, to, allowed_next: current.allowed_next },
+    );
+    if (target.human_gate)
+      fail(
+        actor.role === "human",
+        "human_gate_required",
+        `Stage "${to}" needs a human decision on the board; an agent cannot promote a card into it.`,
+        403,
+        { stage: to, human_gate: true },
+      );
+    let nextRound =
+      Number.isSafeInteger(card.round) && card.round >= 1 ? card.round : 1;
+    if (target.counts_round) nextRound += 1;
+    const maxRounds = this.effectiveMaxRounds(
+      card,
+      workflow,
+      changes.max_rounds,
+    );
+    let stage = target;
+    let blocker;
+    let reason = "";
+    if (nextRound > maxRounds) {
+      const halted = index.get("blocked");
+      fail(
+        halted,
+        "workflow_invalid",
+        "This workflow defines no halted stage, so the round fuse cannot stop rework.",
+        500,
+      );
+      reason = `Round ${nextRound} exceeded max_rounds ${maxRounds}; the card was fused into ${halted.key}.`;
+      stage = halted;
+      blocker = String(changes.blocker || card.blocker || "").trim() || reason;
+    }
+    return {
+      from: currentKey,
+      requested: to,
+      stage: stage.key,
+      status: stage.status,
+      category: stage.category,
+      round: nextRound,
+      max_rounds: maxRounds,
+      blocker,
+      reason,
+      counts_round: Boolean(target.counts_round),
+      human_gate: Boolean(target.human_gate),
+      fused: stage.key !== target.key,
+    };
+  }
+  /** One event per (card, revision); the unique index makes it idempotent. */
+  recordTransition(card, actor, workflow, plan) {
+    const prior = this.db
+      .prepare("SELECT seq FROM workflow_events WHERE card_id=? AND revision=?")
+      .get(card.id, card.revision);
+    if (prior) return null;
+    const event = {
+      event_id: `${card.id}:${card.revision}`,
+      card_id: card.id,
+      work_key: card.work_key || "",
+      project: card.project,
+      revision: card.revision,
+      from_stage: plan.from,
+      to_stage: card.stage,
+      requested_stage: plan.requested,
+      category: plan.category,
+      round: card.round,
+      max_rounds: plan.max_rounds,
+      actor: actor.id,
+      ...(actor.display_actor
+        ? { actor_display: actor.display_actor.name }
+        : {}),
+      status: card.status,
+      implementer: card.implementer || "",
+      reviewer: card.reviewer || "",
+      tester: card.tester || "",
+      pr_url: card.pr_url || "",
+      head_sha: card.head_sha || "",
+      last_verdict: card.last_verdict || "",
+      test_env: card.test_env || "",
+      next_step: card.next_step || "",
+      ...(plan.reason ? { reason: plan.reason } : {}),
+      ...(plan.fused ? { fused: true } : {}),
+      at: now(),
+    };
+    const info = this.db
+      .prepare(
+        "INSERT INTO workflow_events(card_id,revision,document) VALUES(?,?,?)",
+      )
+      .run(card.id, card.revision, "{}");
+    const seq = Number(info.lastInsertRowid);
+    event.seq = seq;
+    this.db
+      .prepare("UPDATE workflow_events SET document=? WHERE seq=?")
+      .run(JSON.stringify(event), seq);
+    return event;
+  }
+  workflowEvents({ after = 0, limit = 100, card_id = "" } = {}) {
+    const boundedLimit = Math.max(
+      1,
+      Math.min(500, Number.isInteger(limit) ? limit : 100),
+    );
+    const cursor = Number.isInteger(after) && after >= 0 ? after : 0;
+    const rows = this.db
+      .prepare(
+        `SELECT seq, document FROM workflow_events WHERE seq > ?${card_id ? " AND card_id = ?" : ""} ORDER BY seq ASC LIMIT ?`,
+      )
+      .all(cursor, ...(card_id ? [card_id] : []), boundedLimit + 1)
+      .map((row) => decode(row));
+    const events = rows.slice(0, boundedLimit);
+    return {
+      events,
+      next_cursor: events.length ? events[events.length - 1].seq : cursor,
+      has_more: rows.length > boundedLimit,
+    };
   }
   get(id, kind = "card") {
     const entity = decode(
@@ -178,7 +493,9 @@ export class BoardStore {
       id: randomUUID(),
       card_id: cardId,
       actor_id: actor.id,
-      ...(actor.display_actor ? { reported_by: actor.display_actor.name, reported_by_verified: false } : {}),
+      ...(actor.display_actor
+        ? { reported_by: actor.display_actor.name, reported_by_verified: false }
+        : {}),
       body,
       system,
       created_at: now(),
@@ -188,8 +505,12 @@ export class BoardStore {
       .run(item.id, cardId, JSON.stringify(item));
     return item;
   }
-  readCard(id, { commentsLimit = null, commentsOffset = 0, commentsOrder = "asc" } = {}) {
-    const card = this.get(id);
+  readCard(
+    id,
+    { commentsLimit = null, commentsOffset = 0, commentsOrder = "asc" } = {},
+  ) {
+    const stored = this.get(id);
+    const card = this.decorateCard(stored, this.workflow(stored.project));
     const total = Number(
       this.db
         .prepare("SELECT count(*) AS n FROM comments WHERE card_id=?")
@@ -198,7 +519,10 @@ export class BoardStore {
     const desc = commentsOrder === "desc";
     if (Number.isInteger(commentsLimit) && commentsLimit > 0) {
       const limit = Math.min(200, commentsLimit);
-      const offset = Math.max(0, Number.isInteger(commentsOffset) ? commentsOffset : 0);
+      const offset = Math.max(
+        0,
+        Number.isInteger(commentsOffset) ? commentsOffset : 0,
+      );
       const comments = this.db
         .prepare(
           `SELECT document FROM comments WHERE card_id=? ORDER BY rowid ${desc ? "DESC" : "ASC"} LIMIT ? OFFSET ?`,
@@ -216,7 +540,9 @@ export class BoardStore {
       };
     }
     const comments = this.db
-      .prepare(`SELECT document FROM comments WHERE card_id=? ORDER BY rowid ${desc ? "DESC" : "ASC"}`)
+      .prepare(
+        `SELECT document FROM comments WHERE card_id=? ORDER BY rowid ${desc ? "DESC" : "ASC"}`,
+      )
       .all(id)
       .map(decode);
     return {
@@ -253,10 +579,17 @@ export class BoardStore {
     limit = 50,
     offset = 0,
   } = {}) {
-    const boundedLimit = Math.max(1, Math.min(200, Number.isInteger(limit) ? limit : 50));
+    const boundedLimit = Math.max(
+      1,
+      Math.min(200, Number.isInteger(limit) ? limit : 50),
+    );
     const boundedOffset = Math.max(0, Number.isInteger(offset) ? offset : 0);
-    const qLower = String(q || "").trim().toLowerCase();
-    const instLower = String(instance || "").trim().toLowerCase();
+    const qLower = String(q || "")
+      .trim()
+      .toLowerCase();
+    const instLower = String(instance || "")
+      .trim()
+      .toLowerCase();
     const topics = this._topicMap();
     const counts = this._commentCounts();
     const matched = this.list("card")
@@ -268,47 +601,82 @@ export class BoardStore {
         if (work_key && c.work_key !== work_key) return false;
         const cardTopic = topics.get(c.id) || "";
         if (topic_id && cardTopic !== topic_id) return false;
-        if (instLower && !String(c.instance || "").toLowerCase().includes(instLower)) return false;
+        if (
+          instLower &&
+          !String(c.instance || "")
+            .toLowerCase()
+            .includes(instLower)
+        )
+          return false;
         if (qLower) {
-          const hit = [c.title, c.work_key, c.next_step, c.blocker, c.instance, c.branch, c.body]
-            .some((v) => String(v || "").toLowerCase().includes(qLower));
+          const hit = [
+            c.title,
+            c.work_key,
+            c.next_step,
+            c.blocker,
+            c.instance,
+            c.branch,
+            c.body,
+          ].some((v) =>
+            String(v || "")
+              .toLowerCase()
+              .includes(qLower),
+          );
           if (!hit) return false;
         }
         return true;
       })
-      .sort((a, b) => String(b.updated_at || "").localeCompare(String(a.updated_at || "")) || a.id.localeCompare(b.id));
+      .sort(
+        (a, b) =>
+          String(b.updated_at || "").localeCompare(
+            String(a.updated_at || ""),
+          ) || a.id.localeCompare(b.id),
+      );
     const total = matched.length;
-    const page = matched.slice(boundedOffset, boundedOffset + boundedLimit).map((c) => {
-      const summary = summarizeBody(c.body || "");
-      return {
-        id: c.id,
-        kind: c.kind,
-        work_key: c.work_key,
-        project: c.project,
-        topic_id: topics.get(c.id) || null,
-        title: c.title,
-        status: c.status,
-        merge_status: c.merge_status,
-        pr_url: c.pr_url,
-        repository: c.repository,
-        branch: c.branch,
-        instance: c.instance,
-        owner_id: c.owner_id,
-        revision: c.revision,
-        layout_revision: c.layout_revision,
-        next_step: c.next_step,
-        blocker: c.blocker,
-        announcement: Boolean(c.announcement),
-        archived_at: c.archived_at,
-        updated_at: c.updated_at,
-        updated_by: c.updated_by,
-        ...(c.updated_by_display ? { updated_by_display: c.updated_by_display } : {}),
-        comment_count: counts.get(c.id) || 0,
-        last_author: summary.last_author,
-        body_preview: summary.body_preview,
-        body_length: summary.body_length,
-      };
-    });
+    const page = matched
+      .slice(boundedOffset, boundedOffset + boundedLimit)
+      .map((row) => {
+        const c = this.decorateCard(row, this.workflow(row.project));
+        const summary = summarizeBody(c.body || "");
+        return {
+          id: c.id,
+          kind: c.kind,
+          work_key: c.work_key,
+          project: c.project,
+          topic_id: topics.get(c.id) || null,
+          title: c.title,
+          status: c.status,
+          stage: c.stage,
+          stage_label: c.stage_label,
+          stage_category: c.stage_category,
+          round: c.round,
+          max_rounds: c.max_rounds,
+          rounds_remaining: c.rounds_remaining,
+          last_verdict: c.last_verdict,
+          head_sha: c.head_sha,
+          merge_status: c.merge_status,
+          pr_url: c.pr_url,
+          repository: c.repository,
+          branch: c.branch,
+          instance: c.instance,
+          owner_id: c.owner_id,
+          revision: c.revision,
+          layout_revision: c.layout_revision,
+          next_step: c.next_step,
+          blocker: c.blocker,
+          announcement: Boolean(c.announcement),
+          archived_at: c.archived_at,
+          updated_at: c.updated_at,
+          updated_by: c.updated_by,
+          ...(c.updated_by_display
+            ? { updated_by_display: c.updated_by_display }
+            : {}),
+          comment_count: counts.get(c.id) || 0,
+          last_author: summary.last_author,
+          body_preview: summary.body_preview,
+          body_length: summary.body_length,
+        };
+      });
     const nextOffset = boundedOffset + page.length;
     const hasMore = nextOffset < total;
     return {
@@ -337,12 +705,23 @@ export class BoardStore {
     );
     const ids = new Set(cards.map((c) => c.id));
     const counts = this._commentCounts();
+    const workflow = this.workflow(project || "");
     return {
       contract: "hashi_whiteboard/v1",
       revision: this.revision(),
       ...(compact ? { compact: true } : {}),
+      workflow: compact
+        ? {
+            version: workflow.version,
+            initial: workflow.initial,
+            max_rounds: workflow.max_rounds,
+            scope: workflow.scope,
+            project: workflow.project,
+          }
+        : workflow,
       announcements: this.announcements(),
-      cards: cards.map((c) => {
+      cards: cards.map((row) => {
+        const c = this.decorateCard(row, workflow);
         const count = counts.get(c.id) || 0;
         if (!compact) return { ...c, comment_count: count };
         const summary = summarizeBody(c.body || "");
@@ -398,7 +777,12 @@ export class BoardStore {
       event = {
         seq: sequence,
         actor_id: actor.id,
-        ...(actor.display_actor ? { reported_by: actor.display_actor.name, reported_by_verified: false } : {}),
+        ...(actor.display_actor
+          ? {
+              reported_by: actor.display_actor.name,
+              reported_by_verified: false,
+            }
+          : {}),
         action: value.action,
         item_id:
           value.item_id ||
@@ -434,7 +818,7 @@ export class BoardStore {
   createCard(actor, data) {
     exactKeys(data, ["kind", "work_key", "topic_id", ...CARD_FIELDS]);
     const { topic_id, ...fields } = data;
-    const content = cardContent(fields);
+    const content = withoutEmptyWorkflowFields(cardContent(fields));
     const prior = content.work_key
       ? decode(
           this.db
@@ -457,8 +841,18 @@ export class BoardStore {
     );
     if (content.kind === "work" && !topic_id) {
       const topics = this.list("card")
-        .filter((c) => c.kind === "topic" && !c.archived_at && c.project === content.project)
-        .map((t) => ({ id: t.id, work_key: t.work_key, title: t.title, project: t.project }));
+        .filter(
+          (c) =>
+            c.kind === "topic" &&
+            !c.archived_at &&
+            c.project === content.project,
+        )
+        .map((t) => ({
+          id: t.id,
+          work_key: t.work_key,
+          title: t.title,
+          project: t.project,
+        }));
       fail(
         false,
         "topic_required",
@@ -495,12 +889,41 @@ export class BoardStore {
         "asset_id does not exist.",
         404,
       );
+    const workflow = this.workflow(content.project);
+    let stageKey = "";
+    if (content.kind === "work") {
+      const index = stageIndex(workflow.stages);
+      stageKey = content.stage || workflow.initial;
+      const stage = index.get(stageKey);
+      fail(
+        stage,
+        "unknown_stage",
+        `Unknown stage "${stageKey}". Read GET /api/workflow for this project's stages.`,
+        400,
+        { stages: workflow.stages.map((s) => s.key) },
+      );
+      fail(
+        !stage.deprecated,
+        "stage_deprecated",
+        `Stage "${stageKey}" is deprecated and cannot be entered.`,
+        409,
+      );
+      if (stage.human_gate)
+        fail(
+          actor.role === "human",
+          "human_gate_required",
+          `Stage "${stageKey}" needs a human decision; create the card on an earlier stage instead.`,
+          403,
+          { stage: stageKey, human_gate: true },
+        );
+    }
     const cardPosition = newCardPosition(
       content.project,
       this.list("card").filter((c) => !c.announcement),
     );
     const card = {
       ...content,
+      ...(content.kind === "work" ? { stage: stageKey, round: 1 } : {}),
       id: randomUUID(),
       owner_id: actor.id,
       created_by: actor.id,
@@ -510,7 +933,9 @@ export class BoardStore {
       created_at: now(),
       updated_at: now(),
       updated_by: actor.id,
-      ...(actor.display_actor ? { updated_by_display: actor.display_actor } : {}),
+      ...(actor.display_actor
+        ? { updated_by_display: actor.display_actor }
+        : {}),
       archived_at: null,
     };
     this.save("card", card);
@@ -522,7 +947,11 @@ export class BoardStore {
           label: "主题归属",
         }).edge
       : null;
-    return { action: "card.created", card, ...(edge ? { edge } : {}) };
+    return {
+      action: "card.created",
+      card: this.decorateCard(card, workflow),
+      ...(edge ? { edge } : {}),
+    };
   }
   updateCard(actor, id, data) {
     exactKeys(data, ["expected_revision", "changes"]);
@@ -535,7 +964,31 @@ export class BoardStore {
       "empty_changes",
       "Supply at least one changed content field.",
     );
-    const content = cardContent(data.changes, card);
+    const changes = { ...data.changes };
+    const workflow = this.workflow(String(changes.project ?? card.project));
+    const storedStage = card.stage || "";
+    let plan = null;
+    if (card.kind === "work" && changes.stage !== undefined) {
+      const requested = String(changes.stage).trim();
+      if (requested && requested !== storedStage)
+        plan = this.planTransition({
+          actor,
+          card,
+          workflow,
+          from: storedStage,
+          to: requested,
+          changes,
+        });
+      if (plan) {
+        changes.stage = plan.stage;
+        changes.status = plan.status;
+        if (plan.blocker !== undefined) changes.blocker = plan.blocker;
+      }
+    }
+    const content = withoutEmptyWorkflowFields(
+      cardContent(changes, card),
+      card,
+    );
     if (content.project !== card.project) {
       fail(
         !this.list("edge").some(
@@ -557,10 +1010,27 @@ export class BoardStore {
       );
     const next = applyUpdatedBy(card, actor, {
       ...content,
+      ...(card.kind === "work" && (content.stage || storedStage)
+        ? {
+            stage: content.stage || storedStage,
+            round: plan
+              ? plan.round
+              : Number.isSafeInteger(card.round) && card.round >= 1
+                ? card.round
+                : 1,
+          }
+        : {}),
       revision: card.revision + 1,
     });
     this.save("card", next);
-    return { action: "card.updated", card: next };
+    const transition = plan
+      ? this.recordTransition(next, actor, workflow, plan)
+      : null;
+    return {
+      action: "card.updated",
+      card: this.decorateCard(next, workflow),
+      ...(transition ? { transition } : {}),
+    };
   }
   layout(actor, id, data) {
     exactKeys(data, ["expected_layout_revision", "position"]);
@@ -1108,6 +1578,9 @@ export class BoardStore {
         .run(new Date(timestamp - 7 * 86400000).toISOString());
       this.db.exec(
         "DELETE FROM activity WHERE seq NOT IN (SELECT seq FROM activity ORDER BY seq DESC LIMIT 2000)",
+      );
+      this.db.exec(
+        "DELETE FROM workflow_events WHERE seq NOT IN (SELECT seq FROM workflow_events ORDER BY seq DESC LIMIT 5000)",
       );
       this.db.exec("COMMIT");
     } catch (error) {

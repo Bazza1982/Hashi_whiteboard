@@ -105,6 +105,23 @@ export function createApp({
     res.json({ ok: true, product: "HASHI Whiteboard", version: "0.1.0" }),
   );
   app.get("/api/guide", (_req, res) => res.json({ ...GUIDE, access }));
+  app.get("/api/workflow", (req, res) =>
+    res.json({
+      workflow: store.workflow(String(req.query.project || "")),
+      defaults: store.workflow("").projects,
+    }),
+  );
+  app.get("/api/workflow/events", (req, res) => {
+    const after = Number.parseInt(String(req.query.after ?? "0"), 10);
+    const limit = Number.parseInt(String(req.query.limit ?? "100"), 10);
+    res.json(
+      store.workflowEvents({
+        after: Number.isFinite(after) ? after : 0,
+        limit: Number.isFinite(limit) ? limit : 100,
+        card_id: String(req.query.card_id || ""),
+      }),
+    );
+  });
   const actorFor = (req) => {
     const authorization = req.get("authorization");
     if (authorization)
@@ -165,7 +182,10 @@ export function createApp({
     if (access.shared_edit && req.actor.id === "lan-shared") {
       const display = String(req.get("x-whiteboard-actor") || "").trim();
       if (display && display.length <= 80) {
-        req.actor = { ...req.actor, display_actor: { name: display, verified: false } };
+        req.actor = {
+          ...req.actor,
+          display_actor: { name: display, verified: false },
+        };
       }
     }
     next();
@@ -209,17 +229,24 @@ export function createApp({
       store.snapshot({
         project: String(req.query.project || ""),
         archived: req.query.archived === "true",
-        compact: req.query.compact === "1" || req.query.compact === "true" || req.query.summary === "true",
+        compact:
+          req.query.compact === "1" ||
+          req.query.compact === "true" ||
+          req.query.summary === "true",
       }),
     ),
   );
   app.get("/api/cards", (req, res) => {
-    const rawLimit = req.query.limit !== undefined ? Number.parseInt(String(req.query.limit), 10) : 50;
-    const rawOffset = req.query.cursor !== undefined
-      ? Number.parseInt(String(req.query.cursor), 10)
-      : req.query.offset !== undefined
-        ? Number.parseInt(String(req.query.offset), 10)
-        : 0;
+    const rawLimit =
+      req.query.limit !== undefined
+        ? Number.parseInt(String(req.query.limit), 10)
+        : 50;
+    const rawOffset =
+      req.query.cursor !== undefined
+        ? Number.parseInt(String(req.query.cursor), 10)
+        : req.query.offset !== undefined
+          ? Number.parseInt(String(req.query.offset), 10)
+          : 0;
     res.json(
       store.listCards({
         project: String(req.query.project || ""),
@@ -236,8 +263,14 @@ export function createApp({
     );
   });
   app.get("/api/cards/:id", (req, res) => {
-    const rawLimit = req.query.comments_limit !== undefined ? Number.parseInt(String(req.query.comments_limit), 10) : null;
-    const rawOffset = req.query.comments_offset !== undefined ? Number.parseInt(String(req.query.comments_offset), 10) : 0;
+    const rawLimit =
+      req.query.comments_limit !== undefined
+        ? Number.parseInt(String(req.query.comments_limit), 10)
+        : null;
+    const rawOffset =
+      req.query.comments_offset !== undefined
+        ? Number.parseInt(String(req.query.comments_offset), 10)
+        : 0;
     const commentsOrder = req.query.comments_order === "desc" ? "desc" : "asc";
     res.json({
       card: store.readCard(req.params.id, {
@@ -262,6 +295,10 @@ export function createApp({
   app.post(
     "/api/cards",
     mutate((req) => store.createCard(req.actor, req.body)),
+  );
+  app.put(
+    "/api/workflow",
+    mutate((req) => store.updateWorkflow(req.actor, req.body)),
   );
   app.post(
     "/api/layout/tidy",

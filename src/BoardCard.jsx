@@ -86,6 +86,19 @@ export default memo(function BoardCard({ data, selected }) {
           {preview || card.body || "写下想法、进展或需要大家知道的事。"}
         </p>
       )}
+      {card.kind === "work" && card.stage && (
+        <div
+          className={`card-stage ${card.stage_category || "active"}`}
+          title={`阶段 ${card.stage} · 第 ${card.round || 1}/${card.max_rounds || 1} 轮`}
+        >
+          <span className="card-stage-label">
+            {card.stage_label || card.stage}
+          </span>
+          <span className="card-round">
+            第 {card.round || 1}/{card.max_rounds || 1} 轮
+          </span>
+        </div>
+      )}
       {card.kind === "work" && card.work_key && (
         <div className="work-key">{card.work_key}</div>
       )}

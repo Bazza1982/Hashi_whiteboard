@@ -7,6 +7,25 @@ export const MERGE_STATUSES = [
   "merged",
   "closed",
 ];
+// Structured handoff metadata for the configurable workflow. These stay
+// optional so cards created before the feature remain readable and editable.
+export const WORKFLOW_FIELDS = [
+  "stage",
+  "max_rounds",
+  "implementer",
+  "reviewer",
+  "tester",
+  "head_sha",
+  "last_verdict",
+  "test_env",
+];
+export const VERDICTS = [
+  "",
+  "approve",
+  "conditional_approve",
+  "request_changes",
+  "blocked",
+];
 export const CARD_FIELDS = [
   "title",
   "body",
@@ -21,7 +40,11 @@ export const CARD_FIELDS = [
   "merge_status",
   "asset_id",
   "announcement",
+  ...WORKFLOW_FIELDS,
 ];
+const CONTENT_FIELDS = CARD_FIELDS.filter(
+  (key) => !WORKFLOW_FIELDS.includes(key),
+);
 export class BoardError extends Error {
   constructor(code, message, status = 400, details = {}) {
     super(message);
@@ -99,7 +122,7 @@ export function cardContent(input, existing = null) {
       "invalid_work_key",
       "Only work/topic cards have a work_key.",
     );
-  for (const key of CARD_FIELDS) {
+  for (const key of CONTENT_FIELDS) {
     if (key === "announcement") {
       out.announcement = input.announcement ?? existing?.announcement ?? false;
       fail(
@@ -182,6 +205,60 @@ export function cardContent(input, existing = null) {
       "invalid_merge_status",
       "Only work cards track pull requests.",
     );
+  const inherited = (key) => input[key] ?? existing?.[key] ?? "";
+  const rounds = (() => {
+    const raw = inherited("max_rounds");
+    if (raw === "" || raw === null) return "";
+    const n =
+      typeof raw === "number" ? raw : Number.parseInt(String(raw).trim(), 10);
+    fail(
+      Number.isSafeInteger(n) && n >= 1 && n <= 50,
+      "invalid_max_rounds",
+      "max_rounds must be an integer between 1 and 50, or empty to inherit the project/global budget.",
+    );
+    return n;
+  })();
+  const stage = text(inherited("stage"), "stage", 40);
+  fail(
+    !stage || /^[a-z][a-z0-9_]{0,39}$/.test(stage),
+    "invalid_stage",
+    "stage must be a lowercase stage key from GET /api/workflow.",
+  );
+  const verdict = text(inherited("last_verdict"), "last_verdict", 20);
+  fail(
+    VERDICTS.includes(verdict),
+    "invalid_verdict",
+    `last_verdict must be empty or one of ${VERDICTS.filter(Boolean).join(", ")}.`,
+  );
+  const sha = text(inherited("head_sha"), "head_sha", 64);
+  fail(
+    !sha || /^[0-9a-f]{7,64}$/i.test(sha),
+    "invalid_head_sha",
+    "head_sha must be a git commit SHA of 7–64 hexadecimal characters.",
+  );
+  Object.assign(out, {
+    stage,
+    max_rounds: rounds,
+    implementer: text(inherited("implementer"), "implementer", 120),
+    reviewer: text(inherited("reviewer"), "reviewer", 120),
+    tester: text(inherited("tester"), "tester", 120),
+    head_sha: sha.toLowerCase(),
+    last_verdict: verdict,
+    test_env: text(inherited("test_env"), "test_env", 80),
+  });
+  if (kind !== "work")
+    fail(
+      !out.stage &&
+        out.max_rounds === "" &&
+        !out.implementer &&
+        !out.reviewer &&
+        !out.tester &&
+        !out.head_sha &&
+        !out.last_verdict &&
+        !out.test_env,
+      "workflow_requires_work_card",
+      "Only work cards carry a stage, a round budget or handoff metadata.",
+    );
   if (kind === "image")
     fail(
       out.asset_id,
@@ -221,6 +298,20 @@ export const GUIDE = {
     blocked: "Cannot proceed; blocker required",
     done: "Task complete; result required; PR may still be open",
   },
+  stage_workflow: {
+    definition:
+      "Stages, labels, allowed transitions and max_rounds live in the board database, not in code. GET /api/workflow?project=name returns the resolved definition (global template merged with the project override). The human owner changes it with PUT /api/workflow and expected_version; stages may be added, relabelled or deprecated without touching old cards.",
+    stages:
+      "Each stage has key, label, label_en, category (active|halted|terminal), status (planned|in_progress|blocked|done), allowed_next, human_gate, counts_round and deprecated. A card stores only stage and round; labels are resolved on read, so relabelling is hot.",
+    rounds:
+      "max_rounds resolves card → project → global. Entering a stage with counts_round:true spends one round. When the next round would exceed the budget the card is fused into the halted stage (blocked) with the reason written into blocker.",
+    human_gate:
+      "A stage with human_gate:true only accepts a human board owner actor. Agents must stop and ask; they cannot promote merged or deployed themselves.",
+    events:
+      "Every accepted stage change appends one event keyed by (card_id, revision) with a monotonic seq. Poll GET /api/workflow/events?after=<seq> for stable consumption; replays of the same revision never duplicate an event.",
+    legacy:
+      "Cards created before this feature have no stage. They stay readable: their stage is derived from status (planned→initial, in_progress→working, blocked→blocked, done→completed) and is only written once someone actually moves them.",
+  },
   merge_status: {
     not_applicable: "Not a PR task",
     not_opened: "No PR yet",
@@ -236,6 +327,11 @@ export const GUIDE = {
     directory:
       "GET /api/cards?project=optional&kind=optional&status=optional&work_key=optional&q=optional&limit=50&offset=0",
     announcements: "GET /api/announcements",
+    workflow: "GET /api/workflow?project=optional",
+    workflow_update:
+      "PUT /api/workflow {expected_version,stages?,max_rounds?,initial?,project?,reset?} (human owner)",
+    workflow_events:
+      "GET /api/workflow/events?after=0&limit=100&card_id=optional",
     read: "GET /api/cards/:id?comments_limit=optional&comments_offset=0&comments_order=asc|desc",
     create:
       "POST /api/cards {kind,work_key,title,project,topic_id,...} (new work requires topic_id)",

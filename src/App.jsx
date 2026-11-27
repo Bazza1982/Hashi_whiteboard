@@ -29,6 +29,13 @@ import { RelationEditor, LinkForm } from "./Relations.jsx";
 import "./relations.css";
 
 const nodeTypes = { whiteboard: BoardCard, project: ProjectHeader };
+const verdictLabels = {
+  "": "未评审",
+  approve: "通过",
+  conditional_approve: "有条件通过",
+  request_changes: "要求修改",
+  blocked: "已阻塞",
+};
 const emptyBoard = {
   cards: [],
   edges: [],
@@ -85,6 +92,17 @@ const messages = {
   membership_required: "工作卡必须保留主题连接。请在详情中调整所属主题。",
   topic_conflict: "所属主题刚被调整，请查看最新归属后再操作。",
   project_has_topic: "卡片已有主题连接，请保持当前项目，避免破坏分区。",
+  unknown_stage: "这个阶段不在当前工作流里，请重新读取阶段列表。",
+  invalid_transition:
+    "这张卡不能直接进入该阶段。请按规定的下一个阶段推进，或先调整工作流定义。",
+  stage_deprecated: "该阶段已弃用，不能再进入。",
+  human_gate_required: "这个阶段需要人类在白板上放行，Agent 不能自行推进。",
+  invalid_max_rounds: "轮次上限请填 1–50 的整数，留空表示继承。",
+  invalid_head_sha: "请填写 7–64 位的提交 SHA。",
+  invalid_verdict: "评审结论不在允许范围内。",
+  admin_required: "只有白板主人可以修改工作流定义。",
+  workflow_conflict: "工作流刚被修改，请重新读取后再改。",
+  invalid_workflow: "工作流定义不合法，请检查阶段键和流转关系。",
 };
 function operationKey() {
   if (crypto.randomUUID) return crypto.randomUUID();
@@ -289,8 +307,14 @@ function Board({ actor, access, onSignIn, onLogout }) {
     const params = new URLSearchParams({ compact: "1" });
     if (includeArchived) params.set("archived", "true");
     const result = await api(`/api/board?${params.toString()}`);
-    if (ticket === snapshotRequest.current && archivedRef.current === includeArchived) {
-      lastBoardRevision.current = Math.max(lastBoardRevision.current, result.revision || 0);
+    if (
+      ticket === snapshotRequest.current &&
+      archivedRef.current === includeArchived
+    ) {
+      lastBoardRevision.current = Math.max(
+        lastBoardRevision.current,
+        result.revision || 0,
+      );
       setBoard(result);
       setLoaded(true);
     }
@@ -322,7 +346,9 @@ function Board({ actor, access, onSignIn, onLogout }) {
     })().catch(() => {
       if (!cancelled) setSearchMatchIds(null);
     });
-    return () => { cancelled = true; };
+    return () => {
+      cancelled = true;
+    };
   }, [query, archived, project, board.revision]);
   useEffect(() => {
     const source = new EventSource("/api/events");
@@ -361,9 +387,14 @@ function Board({ actor, access, onSignIn, onLogout }) {
         (!query ||
           (searchMatchIds
             ? searchMatchIds.has(c.id)
-            : [c.title, c.body, c.body_preview, c.work_key, c.branch, c.instance].some((t) =>
-                t?.toLowerCase().includes(query.toLowerCase()),
-              ))),
+            : [
+                c.title,
+                c.body,
+                c.body_preview,
+                c.work_key,
+                c.branch,
+                c.instance,
+              ].some((t) => t?.toLowerCase().includes(query.toLowerCase())))),
     )
     .sort((a, b) => {
       const rank = (name) =>
@@ -1334,6 +1365,7 @@ function Inspector({
     [target, setTarget] = useState(""),
     [handoffNote, setHandoffNote] = useState(""),
     [saving, setSaving] = useState(false),
+    [workflow, setWorkflow] = useState(null),
     [error, setError] = useState("");
   const read = useCallback(async () => {
     const { card } = await api(`/api/cards/${id}`);
@@ -1346,13 +1378,27 @@ function Inspector({
     read().catch((e) => setError(e.message));
   }, [read]);
   useEffect(() => {
-    if (!base || !latest || latest.comment_count === base.comments?.length) return;
+    if (!base || !latest || latest.comment_count === base.comments?.length)
+      return;
     api(`/api/cards/${id}`)
       .then((x) =>
         setBase((b) => (b ? { ...b, comments: x.card.comments } : b)),
       )
       .catch(() => {});
   }, [latest?.comment_count, id, base?.comments?.length]);
+  // The stage list is configuration, so it is fetched instead of hard-coded.
+  // A failed read leaves the select empty and the server still validates.
+  useEffect(() => {
+    let live = true;
+    api(`/api/workflow?project=${encodeURIComponent(base?.project || "")}`)
+      .then((x) => {
+        if (live) setWorkflow(x.workflow);
+      })
+      .catch(() => {});
+    return () => {
+      live = false;
+    };
+  }, [base?.project]);
   const dirty = Boolean(
     base && form && CARD_FIELDS.some((k) => form[k] !== fieldValue(base, k)),
   );
@@ -1444,7 +1490,9 @@ function Inspector({
         {conflict && (
           <div className="conflict">
             <b>有更新，当前草稿已保留。</b>
-            <p>最新内容：{latest?.body || latest?.body_preview || latest?.title}</p>
+            <p>
+              最新内容：{latest?.body || latest?.body_preview || latest?.title}
+            </p>
             <button onClick={() => copy(JSON.stringify(form, null, 2))}>
               复制我的草稿
             </button>
@@ -1526,6 +1574,33 @@ function Inspector({
                 </select>
               </Field>
             )}
+            {base.kind === "work" && (
+              <Field label="工作流阶段">
+                <select value={form.stage ?? ""} onChange={change("stage")}>
+                  <option value="">（按工作状态自动）</option>
+                  {(workflow?.stages || []).map((stage) => (
+                    <option
+                      key={stage.key}
+                      value={stage.key}
+                      disabled={
+                        stage.deprecated && stage.key !== (form.stage || "")
+                      }
+                    >
+                      {stage.label} · {stage.key}
+                      {stage.human_gate ? "（需人类放行）" : ""}
+                    </option>
+                  ))}
+                </select>
+              </Field>
+            )}
+            {base.kind === "work" && (
+              <small className="muted">
+                当前第 {base.round || 1} 轮 / 上限{" "}
+                {base.max_rounds || workflow?.max_rounds || 3}{" "}
+                轮。退回重做消耗一轮，
+                超出上限自动熔断为「已熔断」；只能按规定阶段推进。
+              </small>
+            )}
             <Field
               label={
                 base.kind === "work"
@@ -1587,6 +1662,56 @@ function Inspector({
                       ))}
                     </select>
                   </Field>
+                  <Field label="评审结论">
+                    <select
+                      value={form.last_verdict ?? ""}
+                      onChange={change("last_verdict")}
+                    >
+                      {Object.entries(verdictLabels).map(([v, t]) => (
+                        <option key={v} value={v}>
+                          {t}
+                        </option>
+                      ))}
+                    </select>
+                  </Field>
+                  <Field
+                    label="本轮轮次上限（留空继承）"
+                    type="number"
+                    min="1"
+                    max="50"
+                    value={form.max_rounds ?? ""}
+                    onChange={change("max_rounds")}
+                  />
+                  <Field
+                    label="审阅提交 SHA"
+                    value={form.head_sha ?? ""}
+                    onChange={change("head_sha")}
+                    placeholder="例如 1f385934"
+                  />
+                  <Field
+                    label="实现者"
+                    value={form.implementer ?? ""}
+                    onChange={change("implementer")}
+                    placeholder="name@instance"
+                  />
+                  <Field
+                    label="评审者"
+                    value={form.reviewer ?? ""}
+                    onChange={change("reviewer")}
+                    placeholder="name@instance"
+                  />
+                  <Field
+                    label="测试者"
+                    value={form.tester ?? ""}
+                    onChange={change("tester")}
+                    placeholder="name@instance"
+                  />
+                  <Field
+                    label="获准测试实例"
+                    value={form.test_env ?? ""}
+                    onChange={change("test_env")}
+                    placeholder="例如 HASHI6"
+                  />
                   <small className="muted">
                     “工作已完成”不会自动意味着“PR 已合并”。
                   </small>
@@ -1606,7 +1731,8 @@ function Inspector({
               <small>
                 {c.reported_by
                   ? `${c.reported_by}${c.reported_by_verified === false ? "（未验证自报）" : ""}`
-                  : actors.find((a) => a.id === c.actor_id)?.name || c.actor_id}{" "}
+                  : actors.find((a) => a.id === c.actor_id)?.name ||
+                    c.actor_id}{" "}
                 · {new Date(c.created_at).toLocaleString("zh-CN")}
               </small>
               <p>{c.body}</p>
