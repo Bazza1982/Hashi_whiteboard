@@ -142,6 +142,34 @@ The coarse `status` field still decides whether a card is planned, in progress,
 blocked or done. A second, optional layer describes _where_ the card sits in the
 team's process. Both are readable on every card; only `stage` is new.
 
+### Strict and flexible modes
+
+The board runs in one of two board-wide modes. The human owner sets it; a
+project override cannot change it.
+
+| Mode               | What the stage does                                                        |
+| ------------------ | -------------------------------------------------------------------------- |
+| `strict` (default) | Enforces the graph, the human gates, deprecated stages and the round fuse. |
+| `flexible`         | Records the stage and keeps the event feed, but refuses no move.           |
+
+In `flexible` mode any actor — agent or human — may move a card to any stage, in
+any direction, including jumping straight to `merged` or back to `initiated`.
+There is no approval step, no round budget and no fuse; a deprecated or gated
+stage is an ordinary choice. Stage, `status` and `workflow_mode` stay on every
+card and every event, so the board, reports and automation still read where work
+stands: **the stage is a status, not a gate.**
+
+Switch modes as the human owner:
+
+```json
+PUT /api/workflow
+{"mode": "flexible", "expected_version": 3}
+```
+
+`schema_version`, `mode`, `initial`, `max_rounds`, `stages` and `projects` are
+the whole definition. A rejected move, a gate and a fuse only exist in `strict`
+mode; `unknown_stage` is still refused because the stage must exist to be read.
+
 ### Reading
 
 Both workflow reads sit behind the same identity check as `/api/board`: in key
@@ -154,10 +182,11 @@ mode an unkeyed request gets `401`, in lan mode the shared identity answers.
 - `stages[]` – `key`, `label`, `label_en`, `category`
   (`active` / `halted` / `terminal`), `status`, `allowed_next`, `human_gate`,
   `counts_round`, `deprecated`
+- `mode` – `strict` or `flexible` (see above)
 - `scope` – `global` or `project`, so you know which layer answered
 
 Card reads, the directory and the snapshot add `stage`, `stage_label`,
-`stage_category`, `round`, `max_rounds`, `max_rounds_own` and
+`stage_category`, `workflow_mode`, `round`, `max_rounds`, `max_rounds_own` and
 `rounds_remaining`. `max_rounds` is the resolved budget in force for the card and
 `max_rounds_own` is the card's own override (`null` when it inherits), so a
 reader with a fresher project budget can do the arithmetic itself instead of
@@ -173,6 +202,8 @@ PATCH /api/cards/:id
 {"expected_revision": 7, "changes": {"stage": "in_review", "head_sha": "1f385934"}}
 ```
 
+In `strict` mode:
+
 - Only `allowed_next` transitions are accepted; anything else returns
   `409 invalid_transition` with the allowed list.
 - Unknown keys return `400 unknown_stage`; deprecated stages return
@@ -186,6 +217,10 @@ PATCH /api/cards/:id
   workflow's fuse stage and the reason is written into `blocker`; the response
   carries `transition.fused` and `transition.reason`.
 
+In `flexible` mode none of the above applies: any stage is accepted from any
+stage, the round still increments as a count, nothing is ever fused, and the
+move is recorded as an ordinary event with `mode: "flexible"`.
+
 ### Stage and status must agree
 
 `stage` is the precise state and `status` is its coarse family (`active` stages
@@ -196,11 +231,12 @@ server keeps them consistent on every save:
   with only a `status` picks the matching stage;
 - a status-only `PATCH` (the pre-existing entry point) also moves the stage to
   that status' stage, so a card never stays on `working` while claiming
-  `blocked`. Once a card is on a stage, that move follows the same rules as the
-  `stage` field — `409 invalid_transition` with the allowed next stages, `403
-  human_gate_required` for a gated target, `409 stage_deprecated` for a
-  deprecated one — so neither field is a side door past the graph. A refused
-  move changes nothing and writes no event. Cards created before this feature
+  `blocked`. Once a card is on a stage, in `strict` mode that move follows the
+  same rules as the `stage` field — `409 invalid_transition` with the allowed
+  next stages, `403 human_gate_required` for a gated target, `409
+stage_deprecated` for a deprecated one — so neither field is a side door past
+  the graph; in `flexible` mode nothing is refused. A refused move changes
+  nothing and writes no event. Cards created before this feature
   have no stage, so their status stays a plain content edit until they move
   once;
 - a `PATCH` that sends both fields is accepted only when the status is the one
@@ -216,7 +252,8 @@ Every resolved workflow must keep one halted stage that agents may enter: the
 first non-deprecated `category: "halted"` stage with `human_gate: false`. It is
 where the round fuse lands, so `PUT /api/workflow` rejects a definition that
 removes it or puts it behind a human gate. Marking the only halted stage
-`human_gate: true` would leave the fuse nowhere to stop.
+`human_gate: true` would leave the fuse nowhere to stop. In `flexible` mode
+there is no fuse, so a definition may omit a halted stage altogether.
 
 Leaving a halted stage is a recovery, not new rework: it spends no round and is
 never fused straight back, so `blocked → archived` completes normally.

@@ -210,6 +210,8 @@ export class BoardStore {
       stage_label_en: stage?.label_en || "",
       stage_category: stage?.category || "active",
       stage_deprecated: Boolean(stage?.deprecated),
+      // Readers can tell whether the stage is enforced or a label only.
+      workflow_mode: workflow.mode || "strict",
       round,
       max_rounds: maxRounds,
       // The card's own override, or null when it inherits. A reader that has a
@@ -229,11 +231,18 @@ export class BoardStore {
     exactKeys(data, [
       "expected_version",
       "project",
+      "mode",
       "stages",
       "max_rounds",
       "initial",
       "reset",
     ]);
+    // mode is board-wide; a project override reskins stages, not enforcement.
+    fail(
+      data.mode === undefined || !String(data.project || "").trim(),
+      "invalid_workflow",
+      "mode applies to the whole board; send it without project to change it.",
+    );
     const base = this.workflow("");
     fail(
       Number.isSafeInteger(data.expected_version),
@@ -282,6 +291,7 @@ export class BoardStore {
     } else {
       document = {
         ...stored,
+        mode: data.mode ?? stored.mode,
         initial: data.initial ?? stored.initial,
         max_rounds: data.max_rounds ?? stored.max_rounds,
         stages: data.stages ?? stored.stages,
@@ -289,7 +299,9 @@ export class BoardStore {
       };
     }
     const validated = validateWorkflow(document);
-    this.assertCardsCanStillMove(validated, project);
+    // Flexible mode refuses no move, so no definition of it can strand a card.
+    if (validated.mode !== "flexible")
+      this.assertCardsCanStillMove(validated, project);
     this.db
       .prepare(
         "INSERT INTO metadata(key,value) VALUES('workflow',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
@@ -352,7 +364,10 @@ export class BoardStore {
    * coarse field cannot be used as a side door into a gated stage. Creation
    * applies the same two rules with its own wording.
    */
-  requireEnterable(actor, stage) {
+  requireEnterable(actor, stage, workflow) {
+    // Flexible mode treats the stage as a recorded label, not a gate: agents
+    // may enter any stage, including a deprecated or human-gated one.
+    if (workflow && workflow.mode === "flexible") return;
     fail(
       !stage.deprecated,
       "stage_deprecated",
@@ -371,6 +386,10 @@ export class BoardStore {
   /** Validate a stage change, spend a review round and fuse over-long rework. */
   planTransition({ actor, card, workflow, from, to, changes }) {
     const index = stageIndex(workflow.stages);
+    // Flexible mode records where the card goes and refuses nothing: any
+    // stage, any direction, any actor. The event still captures the move so
+    // readers and automation (HAL) keep seeing the board's real state.
+    const flexible = workflow.mode === "flexible";
     const target = index.get(to);
     fail(
       target,
@@ -389,13 +408,13 @@ export class BoardStore {
       409,
     );
     fail(
-      current.allowed_next.includes(to),
+      flexible || current.allowed_next.includes(to),
       "invalid_transition",
       `Stage "${currentKey}" cannot move to "${to}". Allowed next: ${current.allowed_next.join(", ") || "none"}.`,
       409,
       { from: currentKey, to, allowed_next: current.allowed_next },
     );
-    this.requireEnterable(actor, target);
+    this.requireEnterable(actor, target, workflow);
     // Leaving a halted stage is a recovery, not another round of rework: it
     // spends no budget and is never fused straight back where it came from.
     const leavingHalt = current.category === "halted";
@@ -416,7 +435,12 @@ export class BoardStore {
     // Only a move that actually spends a round of rework can trip the fuse; a
     // card left over budget by an earlier budget change still finishes its
     // ordinary moves instead of being halted for walking forward.
-    if (!leavingHalt && target.counts_round && nextRound > maxRounds) {
+    if (
+      !flexible &&
+      !leavingHalt &&
+      target.counts_round &&
+      nextRound > maxRounds
+    ) {
       const halted = fuseTarget(workflow.stages);
       fail(
         halted,
@@ -444,6 +468,8 @@ export class BoardStore {
       stage: stage.key,
       status: stage.status,
       category: stage.category,
+      mode: workflow.mode,
+      flexible,
       round: nextRound,
       max_rounds: maxRounds,
       blocker,
@@ -470,6 +496,9 @@ export class BoardStore {
       to_stage: card.stage,
       requested_stage: plan.requested,
       category: plan.category,
+      // How the board was set when this move happened: a flexible move is an
+      // unenforced change, and the feed says so instead of implying a gate.
+      mode: plan.mode || "strict",
       round: card.round,
       max_rounds: plan.max_rounds,
       actor: actor.id,
@@ -1028,20 +1057,23 @@ export class BoardStore {
         400,
         { stages: workflow.stages.map((s) => s.key) },
       );
-      fail(
-        !stage.deprecated,
-        "stage_deprecated",
-        `Stage "${stageKey}" is deprecated and cannot be entered.`,
-        409,
-      );
-      if (stage.human_gate)
+      // Creating a card on any stage is a plain choice in flexible mode.
+      if (workflow.mode !== "flexible") {
         fail(
-          actor.role === "human",
-          "human_gate_required",
-          `Stage "${stageKey}" needs a human decision; create the card on an earlier stage instead.`,
-          403,
-          { stage: stageKey, human_gate: true },
+          !stage.deprecated,
+          "stage_deprecated",
+          `Stage "${stageKey}" is deprecated and cannot be entered.`,
+          409,
         );
+        if (stage.human_gate)
+          fail(
+            actor.role === "human",
+            "human_gate_required",
+            `Stage "${stageKey}" needs a human decision; create the card on an earlier stage instead.`,
+            403,
+            { stage: stageKey, human_gate: true },
+          );
+      }
       // The coarse status always follows the stage that was actually chosen.
       if (content.status !== stage.status) {
         content.status = stage.status;
