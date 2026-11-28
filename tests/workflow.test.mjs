@@ -536,11 +536,15 @@ test("snapshot and card directory expose the resolved stage display fields", asy
 // ---------------------------------------------------------------------------
 
 const stagesNow = async (f, project = "") =>
-  (await f.call(`/api/workflow${project ? `?project=${encodeURIComponent(project)}` : ""}`))
-    .body.workflow;
+  (
+    await f.call(
+      `/api/workflow${project ? `?project=${encodeURIComponent(project)}` : ""}`,
+    )
+  ).body.workflow;
 const putWorkflow = async (f, body) =>
   f.call("/api/workflow", { method: "PUT", body });
-const versionNow = async (f) => (await f.call("/api/workflow")).body.workflow.version;
+const versionNow = async (f) =>
+  (await f.call("/api/workflow")).body.workflow.version;
 
 test("workflow reads need the same identity as the board in key and lan mode", async (t) => {
   const keyed = await fixture();
@@ -548,7 +552,10 @@ test("workflow reads need the same identity as the board in key and lan mode", a
   const anon = await keyed.call("/api/workflow", { token: "" });
   assert.equal(anon.status, 401);
   assert.equal(anon.body.error.code, "unauthorized");
-  assert.equal((await keyed.call("/api/workflow/events", { token: "" })).status, 401);
+  assert.equal(
+    (await keyed.call("/api/workflow/events", { token: "" })).status,
+    401,
+  );
   assert.equal((await keyed.call("/api/board", { token: "" })).status, 401);
   assert.equal((await keyed.call("/api/workflow")).status, 200);
 
@@ -591,7 +598,11 @@ test("editing only a project budget keeps the project stages and initial", async
     method: "POST",
     body: await f.work("workflow/project-start", { project: "phase2" }),
   });
-  assert.equal(created.body.card.stage, "project_start", JSON.stringify(created.body));
+  assert.equal(
+    created.body.card.stage,
+    "project_start",
+    JSON.stringify(created.body),
+  );
 
   // A later budget-only edit must not drop the override's own stages/initial.
   const second = await putWorkflow(f, {
@@ -606,7 +617,9 @@ test("editing only a project budget keeps the project stages and initial", async
   assert.equal(resolved.max_rounds, 2);
   assert.ok(resolved.stages.some((s) => s.key === "project_start"));
 
-  const moved = await patch(f, created.body.card.id, ADMIN, { stage: "working" });
+  const moved = await patch(f, created.body.card.id, ADMIN, {
+    stage: "working",
+  });
   assert.equal(moved.status, 200, JSON.stringify(moved.body));
   assert.equal(moved.body.card.stage, "working");
 });
@@ -739,12 +752,17 @@ test("the fuse lands on the configured halted stage and the definition must keep
 test("a budget cleared in the same edit is already in force, and the fuse reason survives", async (t) => {
   const f = await fixture();
   t.after(() => f.close());
-  const created = await createWork(f, "workflow/budget-edit", { max_rounds: 1 });
+  const created = await createWork(f, "workflow/budget-edit", {
+    max_rounds: 1,
+  });
   const id = created.body.card.id;
   assert.equal(created.body.card.max_rounds, 1);
   await patch(f, id, ADMIN, { stage: "claimed" });
   await patch(f, id, ADMIN, { stage: "working" });
-  await patch(f, id, ADMIN, { stage: "in_review", blocker: "waiting on vendor" });
+  await patch(f, id, ADMIN, {
+    stage: "in_review",
+    blocker: "waiting on vendor",
+  });
 
   // Clearing the card budget inherits the workflow's 3 in this very move.
   const moved = await patch(f, id, ADMIN, {
@@ -780,7 +798,10 @@ test("a fused card can leave the halted stage without another round or a self-tr
   assert.equal(fused.body.card.stage, "blocked");
   const round = fused.body.card.round;
 
-  const left = await patch(f, id, ADMIN, { stage: "archived", body: "wrapped up" });
+  const left = await patch(f, id, ADMIN, {
+    stage: "archived",
+    body: "wrapped up",
+  });
   assert.equal(left.status, 200, JSON.stringify(left.body));
   assert.equal(left.body.card.stage, "archived");
   assert.equal(left.body.card.round, round);
@@ -838,7 +859,11 @@ test("a cursor behind the retained event window is told it expired", async (t) =
     "INSERT INTO workflow_events(card_id,revision,document) VALUES(?,?,?)",
   );
   for (let i = 1; i <= 5003; i++)
-    insert.run("synthetic", i, JSON.stringify({ seq: i, card_id: "synthetic", revision: i }));
+    insert.run(
+      "synthetic",
+      i,
+      JSON.stringify({ seq: i, card_id: "synthetic", revision: i }),
+    );
 
   f.store.prune(Date.now());
 
@@ -855,4 +880,148 @@ test("a cursor behind the retained event window is told it expired", async (t) =
   const fresh = await f.call("/api/workflow/events?after=3");
   assert.equal(fresh.body.gap, undefined);
   assert.equal(fresh.body.events[0].seq, 4);
+});
+
+test("the legacy status entry grants no permission a gated stage would refuse", async (t) => {
+  const f = await fixture();
+  t.after(() => f.close());
+  const { token } = await f.addActor("status-agent");
+  // Put a human gate on a stage the coarse status field can reach on its own.
+  const stages = (await stagesNow(f)).stages.map((s) =>
+    s.key === "completed" ? { ...s, human_gate: true } : s,
+  );
+  const saved = await putWorkflow(f, {
+    expected_version: await versionNow(f),
+    stages,
+  });
+  assert.equal(saved.status, 200, JSON.stringify(saved.body));
+
+  const created = await createWork(
+    f,
+    "workflow/status-gate",
+    { body: "x" },
+    token,
+  );
+  const id = created.body.card.id;
+  for (const stage of ["claimed", "working", "in_review", "approved"]) {
+    const step = await patch(f, id, token, { stage });
+    assert.equal(step.status, 200, `${stage}: ${JSON.stringify(step.body)}`);
+  }
+
+  const byStage = await patch(f, id, token, { stage: "completed" });
+  assert.equal(byStage.status, 403);
+  assert.equal(byStage.body.error.code, "human_gate_required");
+
+  // The coarse field must not be a side door into the same stage.
+  const byStatus = await patch(f, id, token, { status: "done" });
+  assert.equal(byStatus.status, 403, JSON.stringify(byStatus.body));
+  assert.equal(byStatus.body.error.code, "human_gate_required");
+  assert.equal(byStatus.body.error.stage, "completed");
+
+  const after = await f.call(`/api/cards/${id}`);
+  assert.equal(after.body.card.stage, "approved");
+  assert.equal(after.body.card.status, "in_progress");
+  const events = (await f.call("/api/workflow/events?after=0")).body.events;
+  assert.equal(
+    events.filter((e) => e.card_id === id && e.to_stage === "completed").length,
+    0,
+    "a refused move must not leave a transition event behind",
+  );
+
+  // A human still walks through the gate, through either entry point.
+  const human = await patch(f, id, ADMIN, { status: "done" });
+  assert.equal(human.status, 200, JSON.stringify(human.body));
+  assert.equal(human.body.card.stage, "completed");
+  assert.equal(human.body.transition.entry, "status");
+});
+
+test("deprecating a card's only next stage is refused instead of stranding it", async (t) => {
+  const f = await fixture();
+  t.after(() => f.close());
+  const base = (await stagesNow(f)).stages;
+  const extended = [
+    ...base,
+    {
+      key: "handoff",
+      label: "交接",
+      label_en: "Hand-off",
+      category: "active",
+      status: "in_progress",
+      allowed_next: ["qa"],
+    },
+    {
+      key: "qa",
+      label: "质检",
+      label_en: "QA",
+      category: "active",
+      status: "in_progress",
+      allowed_next: ["blocked"],
+    },
+  ];
+  const seeded = await putWorkflow(f, {
+    expected_version: await versionNow(f),
+    stages: extended,
+  });
+  assert.equal(seeded.status, 200, JSON.stringify(seeded.body));
+  const created = await createWork(f, "workflow/only-next", {
+    body: "x",
+    stage: "handoff",
+  });
+  assert.equal(created.status, 200, JSON.stringify(created.body));
+  const id = created.body.card.id;
+
+  // Hand-off can only reach the stage that is about to be deprecated, so
+  // accepting this definition would leave the card with nowhere to go.
+  const refused = await putWorkflow(f, {
+    expected_version: await versionNow(f),
+    stages: extended.map((s) =>
+      s.key === "qa" ? { ...s, deprecated: true } : s,
+    ),
+  });
+  assert.equal(refused.status, 409, JSON.stringify(refused.body));
+  assert.equal(refused.body.error.code, "workflow_strands_cards");
+  assert.match(refused.body.error.message, /workflow\/only-next/);
+  assert.match(refused.body.error.message, /handoff/);
+
+  // The stored definition is untouched, so the card still reaches its stage.
+  const moved = await patch(f, id, ADMIN, { stage: "qa" });
+  assert.equal(moved.status, 200, JSON.stringify(moved.body));
+
+  // Deprecating a stage some other live target can replace is still allowed.
+  const ok = await putWorkflow(f, {
+    expected_version: await versionNow(f),
+    stages: extended.map((s) =>
+      s.key === "working" ? { ...s, deprecated: true } : s,
+    ),
+  });
+  assert.equal(ok.status, 200, JSON.stringify(ok.body));
+});
+
+test("a card carries its own budget apart from the inherited one", async (t) => {
+  const f = await fixture();
+  t.after(() => f.close());
+  const inherited = await createWork(f, "workflow/own-budget-inherit");
+  assert.equal(inherited.body.card.max_rounds, 3);
+  assert.equal(inherited.body.card.max_rounds_own, null);
+  const own = await createWork(f, "workflow/own-budget-set", { max_rounds: 5 });
+  assert.equal(own.body.card.max_rounds_own, 5);
+
+  // Raising the project budget must be visible without re-reading the card:
+  // the resolved number moves, the card's own override does not.
+  const raised = await putWorkflow(f, {
+    expected_version: await versionNow(f),
+    project: "acceptance",
+    max_rounds: 8,
+  });
+  assert.equal(raised.status, 200, JSON.stringify(raised.body));
+  const workflow = await stagesNow(f, "acceptance");
+  assert.equal(workflow.max_rounds, 8);
+  const inheritCard = await f.call(`/api/cards/${inherited.body.card.id}`);
+  assert.equal(inheritCard.body.card.max_rounds_own, null);
+  const ownCard = await f.call(`/api/cards/${own.body.card.id}`);
+  assert.equal(
+    ownCard.body.card.max_rounds,
+    5,
+    "an override outlives the project budget",
+  );
 });

@@ -212,6 +212,10 @@ export class BoardStore {
       stage_deprecated: Boolean(stage?.deprecated),
       round,
       max_rounds: maxRounds,
+      // The card's own override, or null when it inherits. A reader that has a
+      // fresher project/global budget can resolve the number itself instead of
+      // reusing a value that was resolved when its snapshot was taken.
+      max_rounds_own: this.roundBudget(card.max_rounds),
       rounds_remaining: Math.max(0, maxRounds - round),
     };
   }
@@ -312,13 +316,24 @@ export class BoardStore {
       const index = stageIndex(resolveWorkflow(document, card.project).stages);
       const stage = index.get(card.stage);
       const name = card.work_key || card.id;
+      // A listed target that is itself gone or deprecated cannot be entered,
+      // so listing one is not a way out: only a live next stage keeps a card
+      // movable.
+      const reachable = stage
+        ? stage.allowed_next.filter((key) => {
+            const next = index.get(key);
+            return next && !next.deprecated;
+          })
+        : [];
       if (!stage)
         stranded.push(
           `${name} stands on "${card.stage}", which this definition removes`,
         );
-      else if (stage.category !== "terminal" && stage.allowed_next.length === 0)
+      else if (stage.category !== "terminal" && reachable.length === 0)
         stranded.push(
-          `${name} stands on "${stage.key}", which would have no next stage`,
+          stage.allowed_next.length
+            ? `${name} stands on "${stage.key}", whose only next stages (${stage.allowed_next.join(", ")}) would all be unreachable`
+            : `${name} stands on "${stage.key}", which would have no next stage`,
         );
       if (stranded.length >= 5) break;
     }
@@ -329,6 +344,29 @@ export class BoardStore {
       409,
       { stranded },
     );
+  }
+  /**
+   * Whether a stage may be entered at all: it must be live and, when it needs a
+   * human decision, the actor must be that human. Both update entry points — the
+   * stage field and the legacy coarse-status field — share this guard, so the
+   * coarse field cannot be used as a side door into a gated stage. Creation
+   * applies the same two rules with its own wording.
+   */
+  requireEnterable(actor, stage) {
+    fail(
+      !stage.deprecated,
+      "stage_deprecated",
+      `Stage "${stage.key}" is deprecated and cannot be entered.`,
+      409,
+    );
+    if (stage.human_gate)
+      fail(
+        actor.role === "human",
+        "human_gate_required",
+        `Stage "${stage.key}" needs a human decision on the board; an agent cannot promote a card into it.`,
+        403,
+        { stage: stage.key, human_gate: true },
+      );
   }
   /** Validate a stage change, spend a review round and fuse over-long rework. */
   planTransition({ actor, card, workflow, from, to, changes }) {
@@ -351,26 +389,13 @@ export class BoardStore {
       409,
     );
     fail(
-      !target.deprecated,
-      "stage_deprecated",
-      `Stage "${to}" is deprecated and cannot be entered.`,
-      409,
-    );
-    fail(
       current.allowed_next.includes(to),
       "invalid_transition",
       `Stage "${currentKey}" cannot move to "${to}". Allowed next: ${current.allowed_next.join(", ") || "none"}.`,
       409,
       { from: currentKey, to, allowed_next: current.allowed_next },
     );
-    if (target.human_gate)
-      fail(
-        actor.role === "human",
-        "human_gate_required",
-        `Stage "${to}" needs a human decision on the board; an agent cannot promote a card into it.`,
-        403,
-        { stage: to, human_gate: true },
-      );
+    this.requireEnterable(actor, target);
     // Leaving a halted stage is a recovery, not another round of rework: it
     // spends no budget and is never fused straight back where it came from.
     const leavingHalt = current.category === "halted";
@@ -1118,6 +1143,11 @@ export class BoardStore {
         const derived = defaultStageForStatus(workflow.stages, wanted);
         const target = index.get(derived);
         if (target && derived !== storedStage) {
+          // The legacy entry point keeps its coarse jump — old clients only
+          // send status — but it grants no permission: a deprecated stage or a
+          // stage that needs a human decision is refused here exactly as it is
+          // on the stage field, so it cannot be used to slip past a gate.
+          this.requireEnterable(actor, target);
           changes.stage = derived;
           changes.status = target.status;
           statusPlan = {

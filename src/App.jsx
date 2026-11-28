@@ -62,7 +62,11 @@ const blank = {
   announcement: false,
 };
 const fieldValue = (card, key) =>
-  card[key] ?? (key === "announcement" ? false : "");
+  // The round budget field edits the card's own override, so it must show the
+  // override — not the inherited total that the card carries for display.
+  key === "max_rounds"
+    ? (card.max_rounds_own ?? "")
+    : (card[key] ?? (key === "announcement" ? false : ""));
 const messages = {
   unauthorized: "访问已过期，请重新登录。",
   owner_mismatch: "这张卡片属于其他 Agent。您可以留言，或请负责人交接。",
@@ -1599,7 +1603,13 @@ function Inspector({
             {base.kind === "work" && (
               <small className="muted">
                 当前第 {base.round || 1} 轮 / 上限{" "}
-                {base.max_rounds || workflow?.max_rounds || 3}{" "}
+                {/* The card's own override wins; otherwise the freshly read
+                    project/global budget, so a hot edit reaches a detail panel
+                    that was opened before it. */}
+                {base.max_rounds_own ??
+                  workflow?.max_rounds ??
+                  base.max_rounds ??
+                  3}{" "}
                 轮。退回重做消耗一轮，
                 超出上限自动熔断为「已熔断」；只能按规定阶段推进。
               </small>

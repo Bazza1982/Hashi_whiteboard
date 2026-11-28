@@ -157,8 +157,12 @@ mode an unkeyed request gets `401`, in lan mode the shared identity answers.
 - `scope` – `global` or `project`, so you know which layer answered
 
 Card reads, the directory and the snapshot add `stage`, `stage_label`,
-`stage_category`, `round`, `max_rounds` and `rounds_remaining`. Labels come from
-the configuration at read time, so a relabel is immediately visible everywhere.
+`stage_category`, `round`, `max_rounds`, `max_rounds_own` and
+`rounds_remaining`. `max_rounds` is the resolved budget in force for the card and
+`max_rounds_own` is the card's own override (`null` when it inherits), so a
+reader with a fresher project budget can do the arithmetic itself instead of
+reusing a number resolved earlier. Labels come from the configuration at read
+time, so a relabel is immediately visible everywhere.
 
 ### Moving a card
 
@@ -192,7 +196,9 @@ server keeps them consistent on every save:
   with only a `status` picks the matching stage;
 - a status-only `PATCH` (the pre-existing entry point) also moves the stage to
   that status' stage, so a card never stays on `working` while claiming
-  `blocked`;
+  `blocked`. It keeps its coarse jump for old clients but grants no permission:
+  a `human_gate` target answers `403 human_gate_required` and a deprecated one
+  `409 stage_deprecated`, exactly like the `stage` field;
 - both entry points write the same transition event. An edit that leaves the
   stage where it is writes none.
 
