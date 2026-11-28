@@ -159,6 +159,19 @@ stage is an ordinary choice. Stage, `status` and `workflow_mode` stay on every
 card and every event, so the board, reports and automation still read where work
 stands: **the stage is a status, not a gate.**
 
+Flexible mode removes transition rules, not the meaning of the fields. Two checks
+survive in both modes, because they protect the data rather than the process:
+
+- the target stage must exist in the definition (`400 unknown_stage`), and the
+  definition may not remove a stage an existing card stands on
+  (`409 workflow_strands_cards`) — otherwise the card would name a stage the
+  board cannot resolve, and it could neither be read truthfully nor moved again;
+- `stage` and `status` must still agree.
+
+A status-only edit therefore lands on a stage that truly carries the requested
+status, a deprecated one included; a definition with no such stage answers
+`409 status_stage_unavailable` rather than quietly storing a different status.
+
 Switch modes as the human owner:
 
 ```json
@@ -219,7 +232,8 @@ In `strict` mode:
 
 In `flexible` mode none of the above applies: any stage is accepted from any
 stage, the round still increments as a count, nothing is ever fused, and the
-move is recorded as an ordinary event with `mode: "flexible"`.
+move is recorded as an ordinary event with `mode: "flexible"`. The stage must
+still exist and still agree with its `status`; nothing else is checked.
 
 ### Stage and status must agree
 
@@ -228,15 +242,19 @@ are `planned`/`in_progress`, `halted` is `blocked`, `terminal` is `done`). The
 server keeps them consistent on every save:
 
 - creating a card on a stage stores that stage's coarse status, and creating one
-  with only a `status` picks the matching stage;
+  with only a `status` picks a stage that carries it — in `flexible` mode a
+  deprecated stage counts, and a status no stage carries answers
+  `409 status_stage_unavailable` instead of becoming a different status;
 - a status-only `PATCH` (the pre-existing entry point) also moves the stage to
   that status' stage, so a card never stays on `working` while claiming
   `blocked`. Once a card is on a stage, in `strict` mode that move follows the
   same rules as the `stage` field — `409 invalid_transition` with the allowed
   next stages, `403 human_gate_required` for a gated target, `409
 stage_deprecated` for a deprecated one — so neither field is a side door past
-  the graph; in `flexible` mode nothing is refused. A refused move changes
-  nothing and writes no event. Cards created before this feature
+  the graph; in `flexible` mode no transition is refused, but the stage chosen
+  must truly carry the requested status (a deprecated one counts) or the edit
+  answers `409 status_stage_unavailable` instead of swapping the status. A
+  refused move changes nothing and writes no event. Cards created before this feature
   have no stage, so their status stays a plain content edit until they move
   once;
 - a `PATCH` that sends both fields is accepted only when the status is the one
@@ -305,14 +323,24 @@ PUT /api/workflow
 `409 workflow_conflict` with the current definition. `reset: true` drops a
 project override, or restores the built-in template when no project is given.
 Stages are validated as a graph: unique keys, known `allowed_next` targets,
-category-consistent status values, and a halted fuse stage agents may enter.
+category-consistent status values, and — in `strict` mode only — a halted fuse
+stage agents may enter.
 
 A project override is edited field by field. Sending only `max_rounds` keeps
 that project's own `stages` and `initial`; send `""` for a field to drop it and
-inherit the global value. A definition that would strand an existing live card —
-its stage disappears, or a non-terminal stage loses every next stage — is
-rejected with `409 workflow_strands_cards` naming the cards, so an edit cannot
-leave a card that can never move again.
+inherit the global value.
+
+An edit may not strand an existing live card, and the two modes are checked for
+different reasons:
+
+- in both modes, a definition that removes a stage a live card stands on is
+  rejected with `409 workflow_strands_cards` naming the cards. The card would
+  otherwise name a stage the board cannot resolve, and could neither be read
+  truthfully nor moved again. Deprecating the stage is the supported way to
+  retire it;
+- in `strict` mode only, the same error also covers a non-terminal stage that
+  would lose every next stage, because only strict mode refuses a move on the
+  graph. Flexible mode never asks how a card leaves a stage.
 
 ### Legacy cards
 

@@ -445,11 +445,6 @@ export function resolveWorkflow(stored, project = "") {
   };
 }
 
-/** Flexible mode: the stage is recorded, never enforced. */
-export function isFlexible(workflow) {
-  return workflow?.mode === "flexible";
-}
-
 export function stageIndex(stages) {
   return new Map(stages.map((stage) => [stage.key, stage]));
 }
@@ -489,4 +484,26 @@ export function defaultStageForStatus(stages, status) {
     stages.find((s) => !s.deprecated) ||
     stages[0];
   return stage.key;
+}
+
+/**
+ * The stage that truly carries a coarse status, or null when the definition has
+ * none. Unlike defaultStageForStatus this never settles for a stage with a
+ * different status: a caller that must keep the requested status — a status-only
+ * edit, or a card born on a status — reports the gap instead of substituting.
+ * Deprecated stages only count where the mode treats them as ordinary choices.
+ */
+export function stageCarryingStatus(
+  stages,
+  status,
+  { includeDeprecated = false } = {},
+) {
+  const usable = includeDeprecated
+    ? stages
+    : stages.filter((stage) => !stage.deprecated);
+  const preferred = CANONICAL_STAGE[status];
+  const canonical = preferred
+    ? usable.find((stage) => stage.key === preferred)
+    : null;
+  return canonical || usable.find((stage) => stage.status === status) || null;
 }

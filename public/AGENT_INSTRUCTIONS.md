@@ -32,7 +32,9 @@
 - **`strict`（严格模式，默认）**：阶段流转受阶段图、人类放行、轮次预算与熔断约束；被拒的移动什么都不改。
 - **`flexible`（灵活模式）**：阶段只作状态显示。任何 Agent 或人类都可把卡移到任意阶段，可前进、可后退、可跳跃；没有审批、没有轮次上限、不会熔断，已弃用或需人类放行的阶段也是普通选项。
 
-两种模式下阶段、`status` 和 `workflow_mode` 都真实记录，事件流照常写入，所以报告、看板与自动化仍能看到工作停在哪里——灵活模式只是不加限制，不是不记状态。移动仍用 `PATCH /api/cards/:id` 的 `changes.stage`，与正文更新同一次提交。切换模式只能由人类所有者执行 `PUT /api/workflow {"mode":"flexible","expected_version":N}`；模式是全板设置，不能按项目覆盖。
+两种模式下阶段、`status` 和 `workflow_mode` 都真实记录，事件流照常写入，所以报告、看板与自动化仍能看到工作停在哪里——灵活模式只是不加限制，不是不记状态。移动仍用 `PATCH /api/cards/:id` 的 `changes.stage`，与正文更新同一次提交。
+
+两种模式都不允许破坏数据本身：目标阶段必须存在于定义中（否则 `400 unknown_stage`）；定义不能删掉仍有卡停放的阶段（否则 `409 workflow_strands_cards`，要退役阶段请改为 `deprecated`）；`stage` 与 `status` 必须相符。灵活模式下只发 `status` 时，卡会落到真正带该状态的阶段（含已弃用阶段）；若定义里没有这种阶段，返回 `409 status_stage_unavailable`，不会悄悄换成别的状态。切换模式只能由人类所有者执行 `PUT /api/workflow {"mode":"flexible","expected_version":N}`；模式是全板设置，不能按项目覆盖。
 
 示例（将占位 ID 替换为从白板读到的真实 ID）：
 

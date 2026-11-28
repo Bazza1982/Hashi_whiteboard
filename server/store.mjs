@@ -23,6 +23,7 @@ import {
   normalizeWorkflow,
   stageIndex,
   defaultStageForStatus,
+  stageCarryingStatus,
   fuseTarget,
 } from "../shared/workflow.mjs";
 
@@ -191,6 +192,32 @@ export class BoardStore {
       workflow.max_rounds
     );
   }
+  /**
+   * Flexible mode only: the stage that truly carries a requested coarse status,
+   * deprecated stages included, because they are ordinary choices there. A
+   * definition with no such stage is reported instead of the status being
+   * silently replaced by another one.
+   */
+  flexibleStageForStatus(workflow, status) {
+    const stage = stageCarryingStatus(workflow.stages, status, {
+      includeDeprecated: true,
+    });
+    fail(
+      stage,
+      "status_stage_unavailable",
+      `No stage in this workflow carries status "${status}", so the card cannot keep the status you asked for. Add a stage with that status, or name the stage you want and let the status follow it. Nothing was changed.`,
+      409,
+      {
+        status,
+        stages: workflow.stages.map((s) => ({
+          key: s.key,
+          status: s.status,
+          deprecated: s.deprecated,
+        })),
+      },
+    );
+    return stage.key;
+  }
   /** Add derived stage display fields without rewriting the stored card. */
   decorateCard(card, workflow) {
     if (!card || card.kind !== "work") return card;
@@ -299,7 +326,11 @@ export class BoardStore {
       };
     }
     const validated = validateWorkflow(document);
-    // Flexible mode refuses no move, so no definition of it can strand a card.
+    // Two different questions. Where a card stands must stay resolvable in both
+    // modes, or the card can neither be read truthfully nor moved again. Only
+    // strict mode also requires every live stage to keep a next stage, because
+    // only strict mode refuses a move on the graph.
+    this.assertCardsKeepTheirStages(validated, project);
     if (validated.mode !== "flexible")
       this.assertCardsCanStillMove(validated, project);
     this.db
@@ -316,9 +347,36 @@ export class BoardStore {
     };
   }
   /**
-   * A definition edit must not strand cards that already exist: a live card
-   * whose stage disappears would fail its next move with unknown_stage, and a
-   * non-terminal stage with nowhere to go is a dead end.
+   * Stage reference integrity, and not a transition rule: a live card must keep
+   * standing on a stage the definition still defines. It holds in both modes,
+   * because a card whose stage has been removed can neither be read truthfully
+   * (readers would derive some other stage from its status) nor moved again
+   * (its "from" no longer exists). Deprecating a stage is enough to retire it.
+   */
+  assertCardsKeepTheirStages(document, project = "") {
+    const stranded = [];
+    for (const card of this.list("card")) {
+      if (card.kind !== "work" || card.archived_at || !card.stage) continue;
+      if (project && card.project !== project) continue;
+      const index = stageIndex(resolveWorkflow(document, card.project).stages);
+      if (index.has(card.stage)) continue;
+      stranded.push(
+        `${card.work_key || card.id} stands on "${card.stage}", which this definition removes`,
+      );
+      if (stranded.length >= 5) break;
+    }
+    fail(
+      !stranded.length,
+      "workflow_strands_cards",
+      `This definition removes stages that existing cards stand on: ${stranded.join("; ")}. Keep those stages — deprecating them is enough — or move the cards first, so no card is left naming a stage the board cannot resolve.`,
+      409,
+      { stranded, reason: "stage_reference" },
+    );
+  }
+  /**
+   * Strict-mode graph integrity: a live card on a non-terminal stage must keep a
+   * next stage it can actually enter. Flexible mode refuses no move, so it never
+   * asks this question — a stage with no next stage is still a fine label there.
    */
   assertCardsCanStillMove(document, project = "") {
     const stranded = [];
@@ -327,21 +385,17 @@ export class BoardStore {
       if (project && card.project !== project) continue;
       const index = stageIndex(resolveWorkflow(document, card.project).stages);
       const stage = index.get(card.stage);
+      // A removed stage is reported by assertCardsKeepTheirStages instead.
+      if (!stage) continue;
       const name = card.work_key || card.id;
       // A listed target that is itself gone or deprecated cannot be entered,
       // so listing one is not a way out: only a live next stage keeps a card
       // movable.
-      const reachable = stage
-        ? stage.allowed_next.filter((key) => {
-            const next = index.get(key);
-            return next && !next.deprecated;
-          })
-        : [];
-      if (!stage)
-        stranded.push(
-          `${name} stands on "${card.stage}", which this definition removes`,
-        );
-      else if (stage.category !== "terminal" && reachable.length === 0)
+      const reachable = stage.allowed_next.filter((key) => {
+        const next = index.get(key);
+        return next && !next.deprecated;
+      });
+      if (stage.category !== "terminal" && reachable.length === 0)
         stranded.push(
           stage.allowed_next.length
             ? `${name} stands on "${stage.key}", whose only next stages (${stage.allowed_next.join(", ")}) would all be unreachable`
@@ -354,7 +408,7 @@ export class BoardStore {
       "workflow_strands_cards",
       `This definition would leave existing cards unable to move: ${stranded.join("; ")}. Keep those stages, add a reachable next stage, or move the cards first.`,
       409,
-      { stranded },
+      { stranded, reason: "stage_graph" },
     );
   }
   /**
@@ -1043,12 +1097,20 @@ export class BoardStore {
     if (content.kind === "work") {
       const index = stageIndex(workflow.stages);
       // An explicit stage wins; otherwise the coarse status picks the stage, so
-      // a card cannot be born on "initiated" while claiming it is done.
+      // a card cannot be born on "initiated" while claiming it is done. A
+      // flexible board keeps the requested status too: the card lands on a stage
+      // that truly carries it — the initial stage when that one does — and a
+      // status no stage carries is reported instead of quietly replaced.
       stageKey =
         content.stage ||
-        (content.status === "planned"
-          ? workflow.initial
-          : defaultStageForStatus(workflow.stages, content.status));
+        (workflow.mode === "flexible"
+          ? content.status === "planned" &&
+            index.get(workflow.initial)?.status === "planned"
+            ? workflow.initial
+            : this.flexibleStageForStatus(workflow, content.status)
+          : content.status === "planned"
+            ? workflow.initial
+            : defaultStageForStatus(workflow.stages, content.status));
       const stage = index.get(stageKey);
       fail(
         stage,
@@ -1166,10 +1228,14 @@ export class BoardStore {
         ? String(changes.status ?? "").trim()
         : "";
       // A coarse status that really changed asks for the stage carrying it; an
-      // unchanged one asks for no move at all.
+      // unchanged one asks for no move at all. Flexible mode must land on a
+      // stage that really carries that status, so the status the caller asked
+      // for is never swapped for another one behind their back.
       const derived =
         !explicit && wantedStatus && wantedStatus !== card.status
-          ? defaultStageForStatus(workflow.stages, wantedStatus)
+          ? workflow.mode === "flexible"
+            ? this.flexibleStageForStatus(workflow, wantedStatus)
+            : defaultStageForStatus(workflow.stages, wantedStatus)
           : "";
       const requested = explicit || derived;
       const target = requested ? index.get(requested) : null;
