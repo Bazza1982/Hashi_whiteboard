@@ -1199,7 +1199,10 @@ test("a legacy card's first stage pick walks the graph and records the move", as
   assert.equal(events[0].to_stage, "in_review");
 
   // And the human gate still stops the agent on that same card.
-  assert.equal((await patch(f, id, agent.token, { stage: "approved" })).status, 200);
+  assert.equal(
+    (await patch(f, id, agent.token, { stage: "approved" })).status,
+    200,
+  );
   const gate = await patch(f, id, agent.token, { stage: "merged" });
   assert.equal(gate.status, 403, JSON.stringify(gate.body));
   assert.equal(gate.body.error.code, "human_gate_required");
@@ -1243,4 +1246,338 @@ test("an empty stage follows the work status instead of skipping the check", asy
     (await f.call(`/api/workflow/events?card_id=${id}`)).body.events.length,
     1,
   );
+});
+
+test("flexible mode records any move and refuses nothing", async (t) => {
+  const f = await fixture();
+  t.after(() => f.close());
+  const initial = await f.call("/api/workflow");
+  const stages = initial.body.workflow.stages.map((stage) =>
+    stage.key === "working"
+      ? { ...stage, allowed_next: [...stage.allowed_next, "shelved"] }
+      : stage,
+  );
+  stages.push({
+    key: "shelved",
+    label: "已搁置",
+    label_en: "Shelved",
+    category: "active",
+    status: "in_progress",
+    allowed_next: ["working"],
+    human_gate: false,
+    counts_round: false,
+    deprecated: true,
+  });
+  const switched = await f.call("/api/workflow", {
+    method: "PUT",
+    body: {
+      expected_version: initial.body.workflow.version,
+      mode: "flexible",
+      max_rounds: 1,
+      stages,
+    },
+  });
+  assert.equal(switched.status, 200, JSON.stringify(switched.body));
+  assert.equal(switched.body.workflow.mode, "flexible");
+  assert.equal((await f.call("/api/workflow")).body.workflow.mode, "flexible");
+
+  const { token } = await f.addActor("flexible-agent");
+  const created = await createWork(
+    f,
+    "workflow/flexible",
+    { body: "recorded result" },
+    token,
+  );
+  const card = created.body.card;
+  assert.equal(card.workflow_mode, "flexible");
+  assert.equal(card.stage, "initiated");
+  const id = card.id;
+
+  // An agent jumps straight into a human-gated terminal stage, walks backwards,
+  // then lands on a deprecated stage. Nothing is refused and nothing needs
+  // approval, because the stage is a status here, not a gate.
+  for (const stage of [
+    "merged",
+    "blocked",
+    "shelved",
+    "approved",
+    "initiated",
+  ]) {
+    const moved = await patch(f, id, token, {
+      stage,
+      // A blocked card must still say why: that is card content, not a gate.
+      ...(stage === "blocked" ? { blocker: "waiting on hardware" } : {}),
+    });
+    assert.equal(moved.status, 200, `${stage}: ${JSON.stringify(moved.body)}`);
+    assert.equal(moved.body.card.stage, stage);
+  }
+  // The coarse status still follows the stage, so readers keep a real status.
+  const merged = await patch(f, id, token, { stage: "merged" });
+  assert.equal(merged.status, 200, JSON.stringify(merged.body));
+  assert.equal(merged.body.card.status, "done");
+  assert.equal(merged.body.card.workflow_mode, "flexible");
+
+  // A status-only edit still works and still derives a stage.
+  const byStatus = await patch(f, id, token, { status: "in_progress" });
+  assert.equal(byStatus.status, 200, JSON.stringify(byStatus.body));
+  assert.equal(byStatus.body.card.status, "in_progress");
+
+  // max_rounds is 1 and changes_requested spends a round: strict mode would
+  // fuse here. Flexible mode counts the round and lets the card stand.
+  const rework = await patch(f, id, token, { stage: "changes_requested" });
+  assert.equal(rework.status, 200, JSON.stringify(rework.body));
+  assert.equal(rework.body.card.stage, "changes_requested");
+  assert.equal(rework.body.card.round, 2);
+  assert.equal(rework.body.transition.fused, undefined);
+  assert.equal(rework.body.transition.reason, undefined);
+  // No fuse reason was written; the card keeps its own blocker text.
+  assert.equal(rework.body.card.blocker, "waiting on hardware");
+  // Back to work and into rework again: still counted, still never fused.
+  assert.equal((await patch(f, id, token, { stage: "working" })).status, 200);
+  const again = await patch(f, id, token, { stage: "changes_requested" });
+  assert.equal(again.status, 200, JSON.stringify(again.body));
+  assert.equal(again.body.card.round, 3);
+  assert.equal(again.body.transition.fused, undefined);
+
+  // Every move was recorded, and each event says which mode allowed it.
+  const feed = await f.call(`/api/workflow/events?card_id=${id}`);
+  assert.equal(feed.status, 200);
+  assert.ok(feed.body.events.length >= 7);
+  for (const event of feed.body.events) {
+    assert.equal(event.mode, "flexible");
+  }
+  assert.ok(feed.body.events.some((e) => e.to_stage === "merged"));
+  assert.ok(feed.body.events.some((e) => e.from_stage === "initiated"));
+});
+
+test("flexible mode refuses no move but still keeps every card on a defined stage", async (t) => {
+  const f = await fixture();
+  t.after(() => f.close());
+  const version = (await f.call("/api/workflow")).body.workflow.version;
+  const flexible = await f.call("/api/workflow", {
+    method: "PUT",
+    body: { expected_version: version, mode: "flexible" },
+  });
+  assert.equal(flexible.status, 200, JSON.stringify(flexible.body));
+
+  const { token } = await f.addActor("flexible-reference");
+  const created = await createWork(
+    f,
+    "workflow/flexible-reference",
+    { body: "recorded result" },
+    token,
+  );
+  const id = created.body.card.id;
+  assert.equal((await patch(f, id, token, { stage: "merged" })).status, 200);
+
+  // Every "merged" reference has to go with the stage, so the only thing left
+  // to object to is the card that stands on it.
+  const withoutMerged = (workflow) => {
+    const keys = new Set(
+      workflow.stages.filter((s) => s.key !== "merged").map((s) => s.key),
+    );
+    return workflow.stages
+      .filter((s) => s.key !== "merged")
+      .map((s) => ({
+        ...s,
+        allowed_next: s.allowed_next.filter((key) => keys.has(key)),
+      }));
+  };
+
+  // Removing a stage a live card stands on leaves that card naming a stage the
+  // board cannot resolve: it could neither be read truthfully nor moved again.
+  // That is reference integrity, not a transition rule, so it still applies.
+  const removed = await f.call("/api/workflow", {
+    method: "PUT",
+    body: {
+      expected_version: flexible.body.version,
+      stages: withoutMerged(flexible.body.workflow),
+    },
+  });
+  assert.equal(removed.status, 409, JSON.stringify(removed.body));
+  assert.equal(removed.body.error.code, "workflow_strands_cards");
+  assert.match(removed.body.error.message, /workflow\/flexible-reference/);
+
+  // The stored definition is untouched, so the card still reads its own stage
+  // and still moves wherever it is asked to go.
+  const read = await f.call(`/api/cards/${id}`);
+  assert.equal(read.body.card.stage, "merged");
+  assert.equal((await patch(f, id, token, { stage: "initiated" })).status, 200);
+
+  // With no card left there the same definition is accepted — including a stage
+  // with no next stage, because flexible mode never asks how a card leaves.
+  const accepted = await f.call("/api/workflow", {
+    method: "PUT",
+    body: {
+      expected_version: flexible.body.version,
+      stages: withoutMerged(flexible.body.workflow).map((s) =>
+        s.key === "initiated" ? { ...s, allowed_next: [] } : s,
+      ),
+    },
+  });
+  assert.equal(accepted.status, 200, JSON.stringify(accepted.body));
+  const straight = await patch(f, id, token, { stage: "deployed" });
+  assert.equal(straight.status, 200, JSON.stringify(straight.body));
+  assert.equal(straight.body.card.stage, "deployed");
+});
+
+test("a flexible status-only edit keeps the requested status instead of substituting another", async (t) => {
+  const f = await fixture();
+  t.after(() => f.close());
+  const initial = (await f.call("/api/workflow")).body.workflow;
+  const { token } = await f.addActor("flexible-status");
+
+  // The only stage carrying "blocked" is deprecated, and flexible mode treats a
+  // deprecated stage as an ordinary choice. A card born on that status must
+  // land on it rather than on whatever stage a fallback happens to find.
+  const deprecatedHalt = initial.stages.map((s) =>
+    s.key === "blocked" ? { ...s, deprecated: true } : s,
+  );
+  const flexible = await f.call("/api/workflow", {
+    method: "PUT",
+    body: {
+      expected_version: initial.version,
+      mode: "flexible",
+      stages: deprecatedHalt,
+    },
+  });
+  assert.equal(flexible.status, 200, JSON.stringify(flexible.body));
+
+  const created = await createWork(
+    f,
+    "workflow/flexible-status",
+    { body: "recorded result", status: "blocked", blocker: "waiting on hardware" },
+    token,
+  );
+  assert.equal(created.status, 200, JSON.stringify(created.body));
+  const id = created.body.card.id;
+  assert.equal(created.body.card.status, "blocked");
+  assert.equal(created.body.card.stage, "blocked");
+
+  // The same status sent alone through the legacy coarse field used to skip the
+  // deprecated stage and store another status with it.
+  assert.equal((await patch(f, id, token, { stage: "working" })).status, 200);
+  const blocked = await patch(f, id, token, {
+    status: "blocked",
+    blocker: "waiting on hardware",
+  });
+  assert.equal(blocked.status, 200, JSON.stringify(blocked.body));
+  assert.equal(blocked.body.card.status, "blocked");
+  assert.equal(blocked.body.card.stage, "blocked");
+
+  // With no stage carrying that status at all, the edit is refused with the
+  // reason and the card is left exactly where it was.
+  assert.equal((await patch(f, id, token, { stage: "working" })).status, 200);
+  const noHalt = flexible.body.workflow.stages
+    .filter((s) => s.status !== "blocked")
+    .map((s) => ({
+      ...s,
+      allowed_next: s.allowed_next.filter((key) => key !== "blocked"),
+    }));
+  const withoutHalt = await f.call("/api/workflow", {
+    method: "PUT",
+    body: { expected_version: flexible.body.version, stages: noHalt },
+  });
+  assert.equal(withoutHalt.status, 200, JSON.stringify(withoutHalt.body));
+
+  const refused = await patch(f, id, token, { status: "blocked" });
+  assert.equal(refused.status, 409, JSON.stringify(refused.body));
+  assert.equal(refused.body.error.code, "status_stage_unavailable");
+  const after = await f.call(`/api/cards/${id}`);
+  assert.equal(after.body.card.stage, "working");
+  assert.equal(after.body.card.status, "in_progress");
+
+  // Creation reports the same gap instead of storing a card that claims a
+  // status it does not carry.
+  const unborn = await createWork(
+    f,
+    "workflow/flexible-status-unborn",
+    { body: "recorded result", status: "blocked", blocker: "waiting" },
+    token,
+  );
+  assert.equal(unborn.status, 409, JSON.stringify(unborn.body));
+  assert.equal(unborn.body.error.code, "status_stage_unavailable");
+
+  // A definition may leave the canonical stage carrying another status. The
+  // canonical key then only matches by name, so it must not win: the card has
+  // to land on a stage that truly carries the requested status, not store the
+  // canonical stage's different one.
+  const current = (await f.call("/api/workflow")).body.workflow;
+  const shifted = current.stages.map((s) =>
+    s.key === "working" ? { ...s, status: "planned" } : s,
+  );
+  const shiftedPut = await f.call("/api/workflow", {
+    method: "PUT",
+    body: { expected_version: current.version, stages: shifted },
+  });
+  assert.equal(shiftedPut.status, 200, JSON.stringify(shiftedPut.body));
+
+  assert.equal((await patch(f, id, token, { stage: "initiated" })).status, 200);
+  const carried = await patch(f, id, token, { status: "in_progress" });
+  assert.equal(carried.status, 200, JSON.stringify(carried.body));
+  assert.equal(carried.body.card.status, "in_progress");
+  assert.equal(carried.body.card.stage, "claimed");
+});
+
+test("only the human owner switches mode and a flexible definition needs no fuse stage", async (t) => {
+  const f = await fixture();
+  t.after(() => f.close());
+  const version = (await f.call("/api/workflow")).body.workflow.version;
+  const { token } = await f.addActor("mode-editor");
+
+  const denied = await f.call("/api/workflow", {
+    token,
+    method: "PUT",
+    body: { expected_version: version, mode: "flexible" },
+  });
+  assert.equal(denied.status, 403);
+  assert.equal(denied.body.error.code, "admin_required");
+
+  const bogus = await f.call("/api/workflow", {
+    method: "PUT",
+    body: { expected_version: version, mode: "anything" },
+  });
+  assert.equal(bogus.status, 400);
+  assert.equal(bogus.body.error.code, "invalid_workflow");
+
+  // A flexible board never fuses, so a definition may drop the halted stage.
+  const noHalt = (await f.call("/api/workflow")).body.workflow.stages
+    .filter((stage) => stage.category !== "halted")
+    .map((stage) => ({
+      ...stage,
+      allowed_next: stage.allowed_next.filter((key) => key !== "blocked"),
+    }));
+  const flexible = await f.call("/api/workflow", {
+    method: "PUT",
+    body: { expected_version: version, mode: "flexible", stages: noHalt },
+  });
+  assert.equal(flexible.status, 200, JSON.stringify(flexible.body));
+  assert.equal(flexible.body.workflow.mode, "flexible");
+
+  // The same definition cannot be enforced, so strict mode refuses it.
+  const strict = await f.call("/api/workflow", {
+    method: "PUT",
+    body: { expected_version: flexible.body.version, mode: "strict" },
+  });
+  assert.equal(strict.status, 400);
+  assert.equal(strict.body.error.code, "invalid_workflow");
+
+  // mode is board-wide: a project override may not carry it.
+  const perProject = await f.call("/api/workflow", {
+    method: "PUT",
+    body: {
+      expected_version: flexible.body.version,
+      project: "acceptance",
+      mode: "flexible",
+    },
+  });
+  assert.equal(perProject.status, 400);
+  assert.equal(perProject.body.error.code, "invalid_workflow");
+
+  const reset = await f.call("/api/workflow", {
+    method: "PUT",
+    body: { expected_version: flexible.body.version, reset: true },
+  });
+  assert.equal(reset.status, 200, JSON.stringify(reset.body));
+  assert.equal(reset.body.workflow.mode, "strict");
 });

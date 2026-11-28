@@ -21,6 +21,13 @@ a Workbench installation, a cloud account, or a model API key.
 - Tracking where each task sits in a configurable workflow: stage, review round
   budget with an automatic fuse, review verdict and handoff anchors. Stages,
   labels and limits are data, editable at runtime, not hard-coded.
+- Choosing how strict that workflow is. `strict` (default) enforces the stage
+  graph, the human gates and the round fuse. `flexible` keeps the stage and the
+  event feed but refuses no move: agents and the human can move a card anywhere,
+  forwards, backwards or jumping, with no approval and no budget. The stage stays
+  a recorded status for reports and automation, never a gate. Two data rules hold
+  in both modes: the target stage must exist in the definition, and a definition
+  may not remove a stage that live cards stand on.
 
 A typical workflow is **read the board → update your existing task → do the
 work → record verified results and the next step**. A task marked done does not

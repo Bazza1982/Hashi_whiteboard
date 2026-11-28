@@ -1592,11 +1592,15 @@ function Inspector({
                       key={stage.key}
                       value={stage.key}
                       disabled={
-                        stage.deprecated && stage.key !== (form.stage || "")
+                        workflow?.mode !== "flexible" &&
+                        stage.deprecated &&
+                        stage.key !== (form.stage || "")
                       }
                     >
                       {stage.label} · {stage.key}
-                      {stage.human_gate ? "（需人类放行）" : ""}
+                      {workflow?.mode !== "flexible" && stage.human_gate
+                        ? "（需人类放行）"
+                        : ""}
                     </option>
                   ))}
                 </select>
@@ -1612,8 +1616,9 @@ function Inspector({
                   workflow?.max_rounds ??
                   base.max_rounds ??
                   3}{" "}
-                轮。退回重做消耗一轮，
-                超出上限自动熔断为「已熔断」；只能按规定阶段推进。
+                {workflow?.mode === "flexible"
+                  ? "轮（仅供参考，不会熔断）。灵活模式：任何阶段都能自由前进、后退或跳跃，不设审批，阶段只用于显示状态。"
+                  : "轮。退回重做消耗一轮，超出上限自动熔断为「已熔断」；只能按规定阶段推进。"}
               </small>
             )}
             <Field

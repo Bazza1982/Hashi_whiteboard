@@ -6,6 +6,12 @@ import { fail } from "./contract.mjs";
 export const WORKFLOW_VERSION = 1;
 export const STAGE_KEY = /^[a-z][a-z0-9_]{0,39}$/;
 export const CATEGORIES = ["active", "halted", "terminal"];
+// strict   — the stage graph, the human gates and the round fuse are enforced.
+// flexible — the stage is a recorded status only: every move is allowed, in any
+//            direction, by any actor, with no gate and no budget. The stage and
+//            the event feed stay in place so readers and automation still see
+//            where a card is; nothing is refused because of where it stands.
+export const WORKFLOW_MODES = ["strict", "flexible"];
 // A category fixes the coarse status family; the stage names the exact status
 // so a freshly created card can stay "planned" while already on its first stage.
 const CATEGORY_STATUS = {
@@ -156,6 +162,7 @@ export const DEFAULT_STAGES = [
 
 export const DEFAULT_WORKFLOW = {
   version: WORKFLOW_VERSION,
+  mode: "strict",
   initial: "initiated",
   max_rounds: 3,
   stages: DEFAULT_STAGES,
@@ -303,10 +310,22 @@ function requireFuseTarget(stages, scope) {
 
 export function validateWorkflow(
   input,
-  { initial, max_rounds, projects } = {},
+  { initial, max_rounds, projects, mode } = {},
 ) {
   const stages = validateStages(input?.stages ?? input);
-  requireFuseTarget(stages, "This workflow ");
+  const resolvedMode = text(
+    mode ?? input?.mode ?? "strict",
+    "mode",
+    20,
+    true,
+  ).toLowerCase();
+  fail(
+    WORKFLOW_MODES.includes(resolvedMode),
+    "invalid_workflow",
+    `mode must be one of ${WORKFLOW_MODES.join(", ")}.`,
+  );
+  // Flexible mode never fuses rework, so it does not need a fuse stage.
+  if (resolvedMode === "strict") requireFuseTarget(stages, "This workflow ");
   const keys = new Set(stages.map((s) => s.key));
   const initialKey = text(
     initial ?? input?.initial ?? "initiated",
@@ -349,7 +368,7 @@ export function validateWorkflow(
     const projectStages = override.stages
       ? validateStages(override.stages)
       : stages;
-    if (override.stages)
+    if (override.stages && resolvedMode === "strict")
       requireFuseTarget(projectStages, `projects["${name}"] `);
     const projectRounds = coerceRounds(override.max_rounds);
     const projectInitial = override.initial
@@ -379,6 +398,7 @@ export function validateWorkflow(
   return {
     version: counter,
     schema_version: WORKFLOW_VERSION,
+    mode: resolvedMode,
     initial: initialKey,
     max_rounds: rounds,
     stages,
@@ -402,9 +422,12 @@ export function normalizeWorkflow(stored) {
 export function resolveWorkflow(stored, project = "") {
   const base = normalizeWorkflow(stored);
   const override = project ? base.projects[project] : null;
+  // mode is board-wide on purpose: a project may reshape its stages, but it
+  // cannot make half the board enforce a graph the other half ignores.
   if (!override)
     return {
       version: base.version,
+      mode: base.mode,
       initial: base.initial,
       max_rounds: base.max_rounds,
       stages: base.stages,
@@ -413,6 +436,7 @@ export function resolveWorkflow(stored, project = "") {
     };
   return {
     version: base.version,
+    mode: base.mode,
     initial: override.initial || base.initial,
     max_rounds: override.max_rounds ?? base.max_rounds,
     stages: override.stages || base.stages,
@@ -433,8 +457,9 @@ export function stageIndex(stages) {
  */
 export function fuseTarget(stages) {
   return (
-    stages.find((s) => s.category === "halted" && !s.deprecated && !s.human_gate) ||
-    null
+    stages.find(
+      (s) => s.category === "halted" && !s.deprecated && !s.human_gate,
+    ) || null
   );
 }
 
@@ -459,4 +484,31 @@ export function defaultStageForStatus(stages, status) {
     stages.find((s) => !s.deprecated) ||
     stages[0];
   return stage.key;
+}
+
+/**
+ * The stage that truly carries a coarse status, or null when the definition has
+ * none. Unlike defaultStageForStatus this never settles for a stage with a
+ * different status: a caller that must keep the requested status — a status-only
+ * edit, or a card born on a status — reports the gap instead of substituting.
+ * Deprecated stages only count where the mode treats them as ordinary choices.
+ */
+export function stageCarryingStatus(
+  stages,
+  status,
+  { includeDeprecated = false } = {},
+) {
+  const usable = includeDeprecated
+    ? stages
+    : stages.filter((stage) => !stage.deprecated);
+  const preferred = CANONICAL_STAGE[status];
+  // The canonical key only counts when it really carries this status: a
+  // definition may have moved that stage onto another one, and matching by key
+  // alone would land the caller on it and record the wrong status.
+  const canonical = preferred
+    ? usable.find(
+        (stage) => stage.key === preferred && stage.status === status,
+      )
+    : null;
+  return canonical || usable.find((stage) => stage.status === status) || null;
 }
