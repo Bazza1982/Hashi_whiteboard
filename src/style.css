@@ -1108,3 +1108,33 @@ small {
     bottom: 70px;
   }
 }
+
+/* Workflow stage projection: label plus the review-round budget. */
+.card-stage {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  margin: 6px 0 2px;
+  font-size: 12px;
+  color: #2f3b52;
+}
+.card-stage-label {
+  padding: 1px 8px;
+  border-radius: 999px;
+  background: #e8eefc;
+  border: 1px solid #c3d2f5;
+  font-weight: 600;
+}
+.card-stage.halted .card-stage-label {
+  background: #fdeaea;
+  border-color: #f0bcbc;
+  color: #8a2020;
+}
+.card-stage.terminal .card-stage-label {
+  background: #e9f6ee;
+  border-color: #bfe3cd;
+  color: #1f6b3d;
+}
+.card-round {
+  color: #6b7787;
+}

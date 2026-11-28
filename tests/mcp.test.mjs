@@ -112,7 +112,7 @@ test("actual stdio MCP client discovers and uses the shared authenticated board"
     operation_id: randomUUID(),
     card_id: card.id,
     expected_revision: 1,
-    changes: { status: "done", body: "Verified through stdio MCP." },
+    changes: { status: "in_progress", body: "Verified through stdio MCP." },
   });
   assert.ok(!updated.error);
   const stale = await tool("whiteboard_update_card", {

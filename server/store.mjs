@@ -11,10 +11,20 @@ import {
   version,
   position,
   CARD_FIELDS,
+  WORKFLOW_FIELDS,
 } from "../shared/contract.mjs";
 import { newCardPosition } from "../shared/layout.mjs";
 import { relationOf, validateConnection } from "../shared/relations.mjs";
 import { tidyProjects } from "../shared/tidy.mjs";
+import {
+  DEFAULT_WORKFLOW,
+  resolveWorkflow,
+  validateWorkflow,
+  normalizeWorkflow,
+  stageIndex,
+  defaultStageForStatus,
+  fuseTarget,
+} from "../shared/workflow.mjs";
 
 export const hash = (value) => createHash("sha256").update(value).digest("hex");
 const now = () => new Date().toISOString();
@@ -43,6 +53,20 @@ function summarizeBody(fullBody = "") {
     body_preview: previewSource.slice(0, 240),
     body_length: String(fullBody || "").length,
   };
+}
+
+// Empty workflow fields are inherited, not stored. Keep cards that never used
+// the feature free of the new keys so an unrelated edit stays a content edit.
+function withoutEmptyWorkflowFields(content, existing = null) {
+  for (const key of WORKFLOW_FIELDS) {
+    const empty = content[key] === "" || content[key] === null;
+    const wasEmpty =
+      existing?.[key] === undefined ||
+      existing?.[key] === "" ||
+      existing?.[key] === null;
+    if (empty && wasEmpty) delete content[key];
+  }
+  return content;
 }
 
 function applyUpdatedBy(card, actor, patch = {}) {
@@ -74,6 +98,9 @@ export class BoardStore {
       CREATE TABLE IF NOT EXISTS assets (id TEXT PRIMARY KEY, mime TEXT NOT NULL, body BLOB NOT NULL, created_at TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS layouts (id TEXT PRIMARY KEY, document TEXT NOT NULL);
+      CREATE TABLE IF NOT EXISTS workflow_events (seq INTEGER PRIMARY KEY AUTOINCREMENT, card_id TEXT NOT NULL, revision INTEGER NOT NULL, document TEXT NOT NULL);
+      CREATE UNIQUE INDEX IF NOT EXISTS workflow_events_card_revision ON workflow_events(card_id, revision);
+      CREATE INDEX IF NOT EXISTS workflow_events_card_idx ON workflow_events(card_id);
       INSERT OR IGNORE INTO metadata VALUES('revision','0');`);
     this.db
       .prepare(
@@ -116,6 +143,412 @@ export class BoardStore {
       this.db.prepare("SELECT value FROM metadata WHERE key='revision'").get()
         .value,
     );
+  }
+  workflowMemo() {
+    const value =
+      this.db.prepare("SELECT value FROM metadata WHERE key='workflow'").get()
+        ?.value || "";
+    if (this._wfValue !== value) {
+      let stored = null;
+      if (value) {
+        try {
+          stored = JSON.parse(value);
+        } catch {
+          stored = null;
+        }
+      }
+      this._wfValue = value;
+      this._wfBase = normalizeWorkflow(stored);
+      this._wfCache = new Map();
+    }
+    return this._wfBase;
+  }
+  /** Resolved workflow for a project: global template merged with its override. */
+  workflow(project = "") {
+    const base = this.workflowMemo();
+    const key = `${this._wfValue}\u0000${project}`;
+    let resolved = this._wfCache.get(key);
+    if (!resolved) {
+      resolved = resolveWorkflow(base, project);
+      if (this._wfCache.size > 64) this._wfCache.clear();
+      this._wfCache.set(key, resolved);
+    }
+    return resolved;
+  }
+  /** A positive round budget, or null when the value means "inherit". */
+  roundBudget(value) {
+    if (value === undefined || value === null || value === "") return null;
+    const n =
+      typeof value === "number"
+        ? value
+        : Number.parseInt(String(value).trim(), 10);
+    return Number.isSafeInteger(n) && n >= 1 ? n : null;
+  }
+  effectiveMaxRounds(card, workflow, incoming) {
+    return (
+      this.roundBudget(incoming) ??
+      this.roundBudget(card?.max_rounds) ??
+      workflow.max_rounds
+    );
+  }
+  /** Add derived stage display fields without rewriting the stored card. */
+  decorateCard(card, workflow) {
+    if (!card || card.kind !== "work") return card;
+    const index = stageIndex(workflow.stages);
+    const key =
+      card.stage && index.has(card.stage)
+        ? card.stage
+        : defaultStageForStatus(workflow.stages, card.status);
+    const stage = index.get(key);
+    const round =
+      Number.isSafeInteger(card.round) && card.round >= 1 ? card.round : 1;
+    const maxRounds = this.effectiveMaxRounds(card, workflow);
+    return {
+      ...card,
+      stage: key,
+      stage_label: stage?.label || key,
+      stage_label_en: stage?.label_en || "",
+      stage_category: stage?.category || "active",
+      stage_deprecated: Boolean(stage?.deprecated),
+      round,
+      max_rounds: maxRounds,
+      // The card's own override, or null when it inherits. A reader that has a
+      // fresher project/global budget can resolve the number itself instead of
+      // reusing a value that was resolved when its snapshot was taken.
+      max_rounds_own: this.roundBudget(card.max_rounds),
+      rounds_remaining: Math.max(0, maxRounds - round),
+    };
+  }
+  updateWorkflow(actor, data) {
+    fail(
+      actor.role === "human",
+      "admin_required",
+      "Only the human board owner can change the workflow definition.",
+      403,
+    );
+    exactKeys(data, [
+      "expected_version",
+      "project",
+      "stages",
+      "max_rounds",
+      "initial",
+      "reset",
+    ]);
+    const base = this.workflow("");
+    fail(
+      Number.isSafeInteger(data.expected_version),
+      "version_required",
+      "expected_version must be the integer returned by GET /api/workflow.",
+    );
+    fail(
+      base.version === data.expected_version,
+      "workflow_conflict",
+      "The workflow changed. Read GET /api/workflow, compare, then edit deliberately.",
+      409,
+      { current: base },
+    );
+    const project = String(data.project || "").trim();
+    fail(
+      project.length <= 2000,
+      "invalid_workflow",
+      "project must be at most 2000 characters.",
+    );
+    const stored = this.workflowMemo();
+    let document;
+    if (project) {
+      const projects = { ...stored.projects };
+      if (data.reset === true) delete projects[project];
+      else {
+        fail(
+          ["stages", "max_rounds", "initial"].some(
+            (key) => data[key] !== undefined,
+          ),
+          "empty_changes",
+          `Supply stages, max_rounds or initial for project "${project}", or reset:true to drop its override.`,
+        );
+        // A project override is edited field by field: keep the parts this
+        // request does not mention so a max_rounds-only edit cannot silently
+        // drop the project's own stage list or initial stage.
+        const override = { ...(projects[project] || {}) };
+        if (data.stages !== undefined) override.stages = data.stages;
+        if (data.max_rounds !== undefined)
+          override.max_rounds = data.max_rounds;
+        if (data.initial !== undefined) override.initial = data.initial;
+        projects[project] = override;
+      }
+      document = { ...stored, projects, version: stored.version + 1 };
+    } else if (data.reset === true) {
+      document = { ...DEFAULT_WORKFLOW, version: stored.version + 1 };
+    } else {
+      document = {
+        ...stored,
+        initial: data.initial ?? stored.initial,
+        max_rounds: data.max_rounds ?? stored.max_rounds,
+        stages: data.stages ?? stored.stages,
+        version: stored.version + 1,
+      };
+    }
+    const validated = validateWorkflow(document);
+    this.assertCardsCanStillMove(validated, project);
+    this.db
+      .prepare(
+        "INSERT INTO metadata(key,value) VALUES('workflow',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+      )
+      .run(JSON.stringify(validated));
+    this._wfValue = undefined;
+    this._wfCache = null;
+    return {
+      action: "workflow.updated",
+      workflow: this.workflow(project),
+      version: validated.version,
+    };
+  }
+  /**
+   * A definition edit must not strand cards that already exist: a live card
+   * whose stage disappears would fail its next move with unknown_stage, and a
+   * non-terminal stage with nowhere to go is a dead end.
+   */
+  assertCardsCanStillMove(document, project = "") {
+    const stranded = [];
+    for (const card of this.list("card")) {
+      if (card.kind !== "work" || card.archived_at || !card.stage) continue;
+      if (project && card.project !== project) continue;
+      const index = stageIndex(resolveWorkflow(document, card.project).stages);
+      const stage = index.get(card.stage);
+      const name = card.work_key || card.id;
+      // A listed target that is itself gone or deprecated cannot be entered,
+      // so listing one is not a way out: only a live next stage keeps a card
+      // movable.
+      const reachable = stage
+        ? stage.allowed_next.filter((key) => {
+            const next = index.get(key);
+            return next && !next.deprecated;
+          })
+        : [];
+      if (!stage)
+        stranded.push(
+          `${name} stands on "${card.stage}", which this definition removes`,
+        );
+      else if (stage.category !== "terminal" && reachable.length === 0)
+        stranded.push(
+          stage.allowed_next.length
+            ? `${name} stands on "${stage.key}", whose only next stages (${stage.allowed_next.join(", ")}) would all be unreachable`
+            : `${name} stands on "${stage.key}", which would have no next stage`,
+        );
+      if (stranded.length >= 5) break;
+    }
+    fail(
+      !stranded.length,
+      "workflow_strands_cards",
+      `This definition would leave existing cards unable to move: ${stranded.join("; ")}. Keep those stages, add a reachable next stage, or move the cards first.`,
+      409,
+      { stranded },
+    );
+  }
+  /**
+   * Whether a stage may be entered at all: it must be live and, when it needs a
+   * human decision, the actor must be that human. Both update entry points — the
+   * stage field and the legacy coarse-status field — share this guard, so the
+   * coarse field cannot be used as a side door into a gated stage. Creation
+   * applies the same two rules with its own wording.
+   */
+  requireEnterable(actor, stage) {
+    fail(
+      !stage.deprecated,
+      "stage_deprecated",
+      `Stage "${stage.key}" is deprecated and cannot be entered.`,
+      409,
+    );
+    if (stage.human_gate)
+      fail(
+        actor.role === "human",
+        "human_gate_required",
+        `Stage "${stage.key}" needs a human decision on the board; an agent cannot promote a card into it.`,
+        403,
+        { stage: stage.key, human_gate: true },
+      );
+  }
+  /** Validate a stage change, spend a review round and fuse over-long rework. */
+  planTransition({ actor, card, workflow, from, to, changes }) {
+    const index = stageIndex(workflow.stages);
+    const target = index.get(to);
+    fail(
+      target,
+      "unknown_stage",
+      `Unknown stage "${to}". Read GET /api/workflow for this project's stages.`,
+      400,
+      { stages: workflow.stages.map((stage) => stage.key) },
+    );
+    const currentKey =
+      from || defaultStageForStatus(workflow.stages, card.status);
+    const current = index.get(currentKey);
+    fail(
+      current,
+      "unknown_stage",
+      `This card sits on stage "${currentKey}", which the current workflow does not define.`,
+      409,
+    );
+    fail(
+      current.allowed_next.includes(to),
+      "invalid_transition",
+      `Stage "${currentKey}" cannot move to "${to}". Allowed next: ${current.allowed_next.join(", ") || "none"}.`,
+      409,
+      { from: currentKey, to, allowed_next: current.allowed_next },
+    );
+    this.requireEnterable(actor, target);
+    // Leaving a halted stage is a recovery, not another round of rework: it
+    // spends no budget and is never fused straight back where it came from.
+    const leavingHalt = current.category === "halted";
+    let nextRound =
+      Number.isSafeInteger(card.round) && card.round >= 1 ? card.round : 1;
+    if (target.counts_round && !leavingHalt) nextRound += 1;
+    // A max_rounds carried by this same edit is the budget in force for it,
+    // including an explicit clear, which falls back to the workflow budget.
+    const changedBudget = Boolean(
+      changes && Object.prototype.hasOwnProperty.call(changes, "max_rounds"),
+    );
+    const maxRounds = changedBudget
+      ? (this.roundBudget(changes.max_rounds) ?? workflow.max_rounds)
+      : this.effectiveMaxRounds(card, workflow);
+    let stage = target;
+    let blocker;
+    let reason = "";
+    // Only a move that actually spends a round of rework can trip the fuse; a
+    // card left over budget by an earlier budget change still finishes its
+    // ordinary moves instead of being halted for walking forward.
+    if (!leavingHalt && target.counts_round && nextRound > maxRounds) {
+      const halted = fuseTarget(workflow.stages);
+      fail(
+        halted,
+        "workflow_invalid",
+        "This workflow defines no halted stage an agent may enter, so the round fuse cannot stop rework. Add a halted stage with human_gate false.",
+        409,
+      );
+      if (halted.human_gate)
+        fail(
+          actor.role === "human",
+          "human_gate_required",
+          `Stage "${halted.key}" needs a human decision on the board; the round fuse cannot place a card there.`,
+          403,
+          { stage: halted.key, human_gate: true },
+        );
+      reason = `Round ${nextRound} exceeded max_rounds ${maxRounds}; the card was fused into ${halted.key}.`;
+      stage = halted;
+      // The fuse reason is always recorded; an earlier blocker stays behind it.
+      const prior = String(changes.blocker || card.blocker || "").trim();
+      blocker = prior && prior !== reason ? `${reason} ${prior}` : reason;
+    }
+    return {
+      from: currentKey,
+      requested: to,
+      stage: stage.key,
+      status: stage.status,
+      category: stage.category,
+      round: nextRound,
+      max_rounds: maxRounds,
+      blocker,
+      reason,
+      counts_round: Boolean(target.counts_round) && !leavingHalt,
+      human_gate: Boolean(target.human_gate),
+      fused: stage.key !== target.key,
+      recovered: leavingHalt && stage.key !== currentKey,
+    };
+  }
+  /** One event per (card, revision); the unique index makes it idempotent. */
+  recordTransition(card, actor, workflow, plan) {
+    const prior = this.db
+      .prepare("SELECT seq FROM workflow_events WHERE card_id=? AND revision=?")
+      .get(card.id, card.revision);
+    if (prior) return null;
+    const event = {
+      event_id: `${card.id}:${card.revision}`,
+      card_id: card.id,
+      work_key: card.work_key || "",
+      project: card.project,
+      revision: card.revision,
+      from_stage: plan.from,
+      to_stage: card.stage,
+      requested_stage: plan.requested,
+      category: plan.category,
+      round: card.round,
+      max_rounds: plan.max_rounds,
+      actor: actor.id,
+      ...(actor.display_actor
+        ? { actor_display: actor.display_actor.name }
+        : {}),
+      status: card.status,
+      implementer: card.implementer || "",
+      reviewer: card.reviewer || "",
+      tester: card.tester || "",
+      pr_url: card.pr_url || "",
+      head_sha: card.head_sha || "",
+      last_verdict: card.last_verdict || "",
+      test_env: card.test_env || "",
+      next_step: card.next_step || "",
+      ...(plan.reason ? { reason: plan.reason } : {}),
+      ...(plan.fused ? { fused: true } : {}),
+      ...(plan.entry ? { entry: plan.entry } : {}),
+      at: now(),
+    };
+    const info = this.db
+      .prepare(
+        "INSERT INTO workflow_events(card_id,revision,document) VALUES(?,?,?)",
+      )
+      .run(card.id, card.revision, "{}");
+    const seq = Number(info.lastInsertRowid);
+    event.seq = seq;
+    this.db
+      .prepare("UPDATE workflow_events SET document=? WHERE seq=?")
+      .run(JSON.stringify(event), seq);
+    return event;
+  }
+  /** Highest seq that was dropped by the retention window, 0 when none yet. */
+  eventsFloor() {
+    const raw = this.db
+      .prepare("SELECT value FROM metadata WHERE key='workflow_events_floor'")
+      .get()?.value;
+    const n = Number(raw);
+    return Number.isSafeInteger(n) && n >= 0 ? n : 0;
+  }
+  workflowEvents({ after = 0, limit = 100, card_id = "" } = {}) {
+    const boundedLimit = Math.max(
+      1,
+      Math.min(500, Number.isInteger(limit) ? limit : 100),
+    );
+    const cursor = Number.isInteger(after) && after >= 0 ? after : 0;
+    const oldest = this.db
+      .prepare("SELECT MIN(seq) AS s FROM workflow_events")
+      .get()?.s;
+    const retainedFrom = Number.isSafeInteger(oldest) ? oldest : null;
+    // A cursor behind the retention window would otherwise look like a clean
+    // continuation. Say so, and resume from the oldest event still stored.
+    const floor = this.eventsFloor();
+    const expired = retainedFrom !== null && cursor < retainedFrom - 1;
+    const start = expired ? Math.max(cursor, floor) : cursor;
+    const rows = this.db
+      .prepare(
+        `SELECT seq, document FROM workflow_events WHERE seq > ?${card_id ? " AND card_id = ?" : ""} ORDER BY seq ASC LIMIT ?`,
+      )
+      .all(start, ...(card_id ? [card_id] : []), boundedLimit + 1)
+      .map((row) => decode(row));
+    const events = rows.slice(0, boundedLimit);
+    return {
+      events,
+      next_cursor: events.length ? events[events.length - 1].seq : start,
+      has_more: rows.length > boundedLimit,
+      oldest_seq: retainedFrom,
+      ...(expired
+        ? {
+            gap: {
+              after: cursor,
+              until: (retainedFrom ?? 1) - 1,
+              skipped: (retainedFrom ?? 1) - 1 - cursor,
+            },
+            resync:
+              "This cursor is older than the retained event window. Read GET /api/board for the current card state, then continue from next_cursor; the skipped transitions cannot be replayed.",
+          }
+        : {}),
+    };
   }
   get(id, kind = "card") {
     const entity = decode(
@@ -178,7 +611,9 @@ export class BoardStore {
       id: randomUUID(),
       card_id: cardId,
       actor_id: actor.id,
-      ...(actor.display_actor ? { reported_by: actor.display_actor.name, reported_by_verified: false } : {}),
+      ...(actor.display_actor
+        ? { reported_by: actor.display_actor.name, reported_by_verified: false }
+        : {}),
       body,
       system,
       created_at: now(),
@@ -188,8 +623,12 @@ export class BoardStore {
       .run(item.id, cardId, JSON.stringify(item));
     return item;
   }
-  readCard(id, { commentsLimit = null, commentsOffset = 0, commentsOrder = "asc" } = {}) {
-    const card = this.get(id);
+  readCard(
+    id,
+    { commentsLimit = null, commentsOffset = 0, commentsOrder = "asc" } = {},
+  ) {
+    const stored = this.get(id);
+    const card = this.decorateCard(stored, this.workflow(stored.project));
     const total = Number(
       this.db
         .prepare("SELECT count(*) AS n FROM comments WHERE card_id=?")
@@ -198,7 +637,10 @@ export class BoardStore {
     const desc = commentsOrder === "desc";
     if (Number.isInteger(commentsLimit) && commentsLimit > 0) {
       const limit = Math.min(200, commentsLimit);
-      const offset = Math.max(0, Number.isInteger(commentsOffset) ? commentsOffset : 0);
+      const offset = Math.max(
+        0,
+        Number.isInteger(commentsOffset) ? commentsOffset : 0,
+      );
       const comments = this.db
         .prepare(
           `SELECT document FROM comments WHERE card_id=? ORDER BY rowid ${desc ? "DESC" : "ASC"} LIMIT ? OFFSET ?`,
@@ -216,7 +658,9 @@ export class BoardStore {
       };
     }
     const comments = this.db
-      .prepare(`SELECT document FROM comments WHERE card_id=? ORDER BY rowid ${desc ? "DESC" : "ASC"}`)
+      .prepare(
+        `SELECT document FROM comments WHERE card_id=? ORDER BY rowid ${desc ? "DESC" : "ASC"}`,
+      )
       .all(id)
       .map(decode);
     return {
@@ -253,10 +697,17 @@ export class BoardStore {
     limit = 50,
     offset = 0,
   } = {}) {
-    const boundedLimit = Math.max(1, Math.min(200, Number.isInteger(limit) ? limit : 50));
+    const boundedLimit = Math.max(
+      1,
+      Math.min(200, Number.isInteger(limit) ? limit : 50),
+    );
     const boundedOffset = Math.max(0, Number.isInteger(offset) ? offset : 0);
-    const qLower = String(q || "").trim().toLowerCase();
-    const instLower = String(instance || "").trim().toLowerCase();
+    const qLower = String(q || "")
+      .trim()
+      .toLowerCase();
+    const instLower = String(instance || "")
+      .trim()
+      .toLowerCase();
     const topics = this._topicMap();
     const counts = this._commentCounts();
     const matched = this.list("card")
@@ -268,47 +719,82 @@ export class BoardStore {
         if (work_key && c.work_key !== work_key) return false;
         const cardTopic = topics.get(c.id) || "";
         if (topic_id && cardTopic !== topic_id) return false;
-        if (instLower && !String(c.instance || "").toLowerCase().includes(instLower)) return false;
+        if (
+          instLower &&
+          !String(c.instance || "")
+            .toLowerCase()
+            .includes(instLower)
+        )
+          return false;
         if (qLower) {
-          const hit = [c.title, c.work_key, c.next_step, c.blocker, c.instance, c.branch, c.body]
-            .some((v) => String(v || "").toLowerCase().includes(qLower));
+          const hit = [
+            c.title,
+            c.work_key,
+            c.next_step,
+            c.blocker,
+            c.instance,
+            c.branch,
+            c.body,
+          ].some((v) =>
+            String(v || "")
+              .toLowerCase()
+              .includes(qLower),
+          );
           if (!hit) return false;
         }
         return true;
       })
-      .sort((a, b) => String(b.updated_at || "").localeCompare(String(a.updated_at || "")) || a.id.localeCompare(b.id));
+      .sort(
+        (a, b) =>
+          String(b.updated_at || "").localeCompare(
+            String(a.updated_at || ""),
+          ) || a.id.localeCompare(b.id),
+      );
     const total = matched.length;
-    const page = matched.slice(boundedOffset, boundedOffset + boundedLimit).map((c) => {
-      const summary = summarizeBody(c.body || "");
-      return {
-        id: c.id,
-        kind: c.kind,
-        work_key: c.work_key,
-        project: c.project,
-        topic_id: topics.get(c.id) || null,
-        title: c.title,
-        status: c.status,
-        merge_status: c.merge_status,
-        pr_url: c.pr_url,
-        repository: c.repository,
-        branch: c.branch,
-        instance: c.instance,
-        owner_id: c.owner_id,
-        revision: c.revision,
-        layout_revision: c.layout_revision,
-        next_step: c.next_step,
-        blocker: c.blocker,
-        announcement: Boolean(c.announcement),
-        archived_at: c.archived_at,
-        updated_at: c.updated_at,
-        updated_by: c.updated_by,
-        ...(c.updated_by_display ? { updated_by_display: c.updated_by_display } : {}),
-        comment_count: counts.get(c.id) || 0,
-        last_author: summary.last_author,
-        body_preview: summary.body_preview,
-        body_length: summary.body_length,
-      };
-    });
+    const page = matched
+      .slice(boundedOffset, boundedOffset + boundedLimit)
+      .map((row) => {
+        const c = this.decorateCard(row, this.workflow(row.project));
+        const summary = summarizeBody(c.body || "");
+        return {
+          id: c.id,
+          kind: c.kind,
+          work_key: c.work_key,
+          project: c.project,
+          topic_id: topics.get(c.id) || null,
+          title: c.title,
+          status: c.status,
+          stage: c.stage,
+          stage_label: c.stage_label,
+          stage_category: c.stage_category,
+          round: c.round,
+          max_rounds: c.max_rounds,
+          rounds_remaining: c.rounds_remaining,
+          last_verdict: c.last_verdict,
+          head_sha: c.head_sha,
+          merge_status: c.merge_status,
+          pr_url: c.pr_url,
+          repository: c.repository,
+          branch: c.branch,
+          instance: c.instance,
+          owner_id: c.owner_id,
+          revision: c.revision,
+          layout_revision: c.layout_revision,
+          next_step: c.next_step,
+          blocker: c.blocker,
+          announcement: Boolean(c.announcement),
+          archived_at: c.archived_at,
+          updated_at: c.updated_at,
+          updated_by: c.updated_by,
+          ...(c.updated_by_display
+            ? { updated_by_display: c.updated_by_display }
+            : {}),
+          comment_count: counts.get(c.id) || 0,
+          last_author: summary.last_author,
+          body_preview: summary.body_preview,
+          body_length: summary.body_length,
+        };
+      });
     const nextOffset = boundedOffset + page.length;
     const hasMore = nextOffset < total;
     return {
@@ -337,12 +823,25 @@ export class BoardStore {
     );
     const ids = new Set(cards.map((c) => c.id));
     const counts = this._commentCounts();
+    const workflow = this.workflow(project || "");
     return {
       contract: "hashi_whiteboard/v1",
       revision: this.revision(),
       ...(compact ? { compact: true } : {}),
+      workflow: compact
+        ? {
+            version: workflow.version,
+            initial: workflow.initial,
+            max_rounds: workflow.max_rounds,
+            scope: workflow.scope,
+            project: workflow.project,
+          }
+        : workflow,
       announcements: this.announcements(),
-      cards: cards.map((c) => {
+      cards: cards.map((row) => {
+        // Each card is projected through its own project's definition, so the
+        // board and the card detail cannot disagree about stage or budget.
+        const c = this.decorateCard(row, this.workflow(row.project));
         const count = counts.get(c.id) || 0;
         if (!compact) return { ...c, comment_count: count };
         const summary = summarizeBody(c.body || "");
@@ -398,7 +897,12 @@ export class BoardStore {
       event = {
         seq: sequence,
         actor_id: actor.id,
-        ...(actor.display_actor ? { reported_by: actor.display_actor.name, reported_by_verified: false } : {}),
+        ...(actor.display_actor
+          ? {
+              reported_by: actor.display_actor.name,
+              reported_by_verified: false,
+            }
+          : {}),
         action: value.action,
         item_id:
           value.item_id ||
@@ -434,7 +938,7 @@ export class BoardStore {
   createCard(actor, data) {
     exactKeys(data, ["kind", "work_key", "topic_id", ...CARD_FIELDS]);
     const { topic_id, ...fields } = data;
-    const content = cardContent(fields);
+    const content = withoutEmptyWorkflowFields(cardContent(fields));
     const prior = content.work_key
       ? decode(
           this.db
@@ -457,8 +961,18 @@ export class BoardStore {
     );
     if (content.kind === "work" && !topic_id) {
       const topics = this.list("card")
-        .filter((c) => c.kind === "topic" && !c.archived_at && c.project === content.project)
-        .map((t) => ({ id: t.id, work_key: t.work_key, title: t.title, project: t.project }));
+        .filter(
+          (c) =>
+            c.kind === "topic" &&
+            !c.archived_at &&
+            c.project === content.project,
+        )
+        .map((t) => ({
+          id: t.id,
+          work_key: t.work_key,
+          title: t.title,
+          project: t.project,
+        }));
       fail(
         false,
         "topic_required",
@@ -495,12 +1009,63 @@ export class BoardStore {
         "asset_id does not exist.",
         404,
       );
+    const workflow = this.workflow(content.project);
+    let stageKey = "";
+    if (content.kind === "work") {
+      const index = stageIndex(workflow.stages);
+      // An explicit stage wins; otherwise the coarse status picks the stage, so
+      // a card cannot be born on "initiated" while claiming it is done.
+      stageKey =
+        content.stage ||
+        (content.status === "planned"
+          ? workflow.initial
+          : defaultStageForStatus(workflow.stages, content.status));
+      const stage = index.get(stageKey);
+      fail(
+        stage,
+        "unknown_stage",
+        `Unknown stage "${stageKey}". Read GET /api/workflow for this project's stages.`,
+        400,
+        { stages: workflow.stages.map((s) => s.key) },
+      );
+      fail(
+        !stage.deprecated,
+        "stage_deprecated",
+        `Stage "${stageKey}" is deprecated and cannot be entered.`,
+        409,
+      );
+      if (stage.human_gate)
+        fail(
+          actor.role === "human",
+          "human_gate_required",
+          `Stage "${stageKey}" needs a human decision; create the card on an earlier stage instead.`,
+          403,
+          { stage: stageKey, human_gate: true },
+        );
+      // The coarse status always follows the stage that was actually chosen.
+      if (content.status !== stage.status) {
+        content.status = stage.status;
+        if (content.status === "blocked")
+          fail(
+            content.blocker,
+            "blocker_required",
+            "A blocked work card must explain blocker.",
+          );
+        if (content.status === "done")
+          fail(
+            content.body,
+            "result_required",
+            "A completed work card must describe the result in body.",
+          );
+      }
+    }
     const cardPosition = newCardPosition(
       content.project,
       this.list("card").filter((c) => !c.announcement),
     );
     const card = {
       ...content,
+      ...(content.kind === "work" ? { stage: stageKey, round: 1 } : {}),
       id: randomUUID(),
       owner_id: actor.id,
       created_by: actor.id,
@@ -510,7 +1075,9 @@ export class BoardStore {
       created_at: now(),
       updated_at: now(),
       updated_by: actor.id,
-      ...(actor.display_actor ? { updated_by_display: actor.display_actor } : {}),
+      ...(actor.display_actor
+        ? { updated_by_display: actor.display_actor }
+        : {}),
       archived_at: null,
     };
     this.save("card", card);
@@ -522,7 +1089,11 @@ export class BoardStore {
           label: "主题归属",
         }).edge
       : null;
-    return { action: "card.created", card, ...(edge ? { edge } : {}) };
+    return {
+      action: "card.created",
+      card: this.decorateCard(card, workflow),
+      ...(edge ? { edge } : {}),
+    };
   }
   updateCard(actor, id, data) {
     exactKeys(data, ["expected_revision", "changes"]);
@@ -535,7 +1106,81 @@ export class BoardStore {
       "empty_changes",
       "Supply at least one changed content field.",
     );
-    const content = cardContent(data.changes, card);
+    const changes = { ...data.changes };
+    const workflow = this.workflow(String(changes.project ?? card.project));
+    const storedStage = card.stage || "";
+    const index = stageIndex(workflow.stages);
+    let plan = null;
+    // Where the card stands. A card that predates the feature has no stored
+    // stage, so it stands on whatever its coarse status resolves to — the same
+    // stage a reader sees. That is the "from" its first explicit pick must be
+    // judged against; using an empty "from" would let that pick skip the graph,
+    // the human gate and the event.
+    const fromStage =
+      storedStage || defaultStageForStatus(workflow.stages, card.status);
+    // A card that never used the feature keeps its coarse status as an ordinary
+    // content edit and its stage derived on read; once it names a stage, every
+    // way of moving it — the stage field, the legacy coarse status field, or
+    // both in one edit — travels the same validated transition, so no field can
+    // move a card the graph forbids.
+    if (card.kind === "work") {
+      const sendsStage = changes.stage !== undefined;
+      const sendsStatus = changes.status !== undefined;
+      // The detail panel offers an empty stage as "follow the work status", so
+      // only a named stage is a deliberate pick; an empty one is resolved from
+      // the coarse status exactly like a status edit.
+      const explicit = sendsStage ? String(changes.stage ?? "").trim() : "";
+      const wantedStatus = sendsStatus
+        ? String(changes.status ?? "").trim()
+        : "";
+      // A coarse status that really changed asks for the stage carrying it; an
+      // unchanged one asks for no move at all.
+      const derived =
+        !explicit && wantedStatus && wantedStatus !== card.status
+          ? defaultStageForStatus(workflow.stages, wantedStatus)
+          : "";
+      const requested = explicit || derived;
+      const target = requested ? index.get(requested) : null;
+      // A stage and a status sent together must agree. Applying half of the
+      // pair would store a card whose stage and status contradict each other.
+      if (explicit && wantedStatus && target)
+        fail(
+          wantedStatus === target.status,
+          "status_stage_conflict",
+          `Stage "${target.key}" carries status "${target.status}", but this edit also asks for "${wantedStatus}". Send the stage alone to move the card, or send the status alone so it can pick the stage.`,
+          409,
+          {
+            stage: target.key,
+            status: target.status,
+            requested_status: wantedStatus,
+          },
+        );
+      // A legacy card only moves when it names a stage; a coarse-status-only
+      // edit stays the old content edit it always was.
+      const moves = storedStage
+        ? Boolean(requested) && requested !== fromStage
+        : Boolean(explicit) && explicit !== fromStage;
+      if (moves) {
+        plan = this.planTransition({
+          actor,
+          card,
+          workflow,
+          from: fromStage,
+          to: requested,
+          changes,
+        });
+        // Which field moved the card is recorded on the event; the rules, the
+        // round budget in force and the fuse are the same either way.
+        if (!explicit) plan.entry = "status";
+        changes.stage = plan.stage;
+        changes.status = plan.status;
+        if (plan.blocker !== undefined) changes.blocker = plan.blocker;
+      }
+    }
+    const content = withoutEmptyWorkflowFields(
+      cardContent(changes, card),
+      card,
+    );
     if (content.project !== card.project) {
       fail(
         !this.list("edge").some(
@@ -557,10 +1202,37 @@ export class BoardStore {
       );
     const next = applyUpdatedBy(card, actor, {
       ...content,
+      ...(card.kind === "work" && (content.stage || storedStage)
+        ? {
+            stage: content.stage || storedStage,
+            round: plan
+              ? plan.round
+              : Number.isSafeInteger(card.round) && card.round >= 1
+                ? card.round
+                : 1,
+          }
+        : {}),
       revision: card.revision + 1,
     });
     this.save("card", next);
-    return { action: "card.updated", card: next };
+    const chosen = plan;
+    // One event per real stage move; an edit that leaves the stage in place
+    // (a fused card asked to re-enter its own stage) records nothing.
+    const moved =
+      chosen &&
+      (chosen.stage !== storedStage ||
+        chosen.round !==
+          (Number.isSafeInteger(card.round) && card.round >= 1
+            ? card.round
+            : 1));
+    const transition = moved
+      ? this.recordTransition(next, actor, workflow, chosen)
+      : null;
+    return {
+      action: "card.updated",
+      card: this.decorateCard(next, workflow),
+      ...(transition ? { transition } : {}),
+    };
   }
   layout(actor, id, data) {
     exactKeys(data, ["expected_layout_revision", "position"]);
@@ -1109,6 +1781,20 @@ export class BoardStore {
       this.db.exec(
         "DELETE FROM activity WHERE seq NOT IN (SELECT seq FROM activity ORDER BY seq DESC LIMIT 2000)",
       );
+      this.db.exec(
+        "DELETE FROM workflow_events WHERE seq NOT IN (SELECT seq FROM workflow_events ORDER BY seq DESC LIMIT 5000)",
+      );
+      // Remember the last seq the window dropped so a late consumer is told
+      // its cursor expired instead of silently resuming with a hole.
+      const retained = this.db
+        .prepare("SELECT MIN(seq) AS s FROM workflow_events")
+        .get()?.s;
+      if (Number.isSafeInteger(retained) && retained - 1 > this.eventsFloor())
+        this.db
+          .prepare(
+            "INSERT INTO metadata(key,value) VALUES('workflow_events_floor',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+          )
+          .run(String(retained - 1));
       this.db.exec("COMMIT");
     } catch (error) {
       this.db.exec("ROLLBACK");

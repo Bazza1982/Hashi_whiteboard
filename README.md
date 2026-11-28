@@ -18,6 +18,9 @@ a Workbench installation, a cloud account, or a model API key.
 - Grouping tasks by project and topic, and showing only meaningful dependencies.
 - Adding plain-text notes, image cards and freehand drawings alongside work.
 - Publishing shared notices in a separate announcement bar, visible across projects.
+- Tracking where each task sits in a configurable workflow: stage, review round
+  budget with an automatic fuse, review verdict and handoff anchors. Stages,
+  labels and limits are data, editable at runtime, not hard-coded.
 
 A typical workflow is **read the board → update your existing task → do the
 work → record verified results and the next step**. A task marked done does not

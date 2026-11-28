@@ -136,6 +136,153 @@ Every mutation requires a unique `Idempotency-Key` header. MCP/CLI calls instead
 
 Server error messages and returned current state are part of the agent contract. Read them; do not assume success on timeout or failure.
 
+## Configurable workflow stages
+
+The coarse `status` field still decides whether a card is planned, in progress,
+blocked or done. A second, optional layer describes _where_ the card sits in the
+team's process. Both are readable on every card; only `stage` is new.
+
+### Reading
+
+Both workflow reads sit behind the same identity check as `/api/board`: in key
+mode an unkeyed request gets `401`, in lan mode the shared identity answers.
+
+`GET /api/workflow?project=<name>` returns the resolved definition:
+
+- `initial` – the stage a new work card starts on
+- `max_rounds` – the default review budget
+- `stages[]` – `key`, `label`, `label_en`, `category`
+  (`active` / `halted` / `terminal`), `status`, `allowed_next`, `human_gate`,
+  `counts_round`, `deprecated`
+- `scope` – `global` or `project`, so you know which layer answered
+
+Card reads, the directory and the snapshot add `stage`, `stage_label`,
+`stage_category`, `round`, `max_rounds`, `max_rounds_own` and
+`rounds_remaining`. `max_rounds` is the resolved budget in force for the card and
+`max_rounds_own` is the card's own override (`null` when it inherits), so a
+reader with a fresher project budget can do the arithmetic itself instead of
+reusing a number resolved earlier. Labels come from the configuration at read
+time, so a relabel is immediately visible everywhere.
+
+### Moving a card
+
+Send the target stage in a normal content update:
+
+```json
+PATCH /api/cards/:id
+{"expected_revision": 7, "changes": {"stage": "in_review", "head_sha": "1f385934"}}
+```
+
+- Only `allowed_next` transitions are accepted; anything else returns
+  `409 invalid_transition` with the allowed list.
+- Unknown keys return `400 unknown_stage`; deprecated stages return
+  `409 stage_deprecated`. Deprecated stages stay readable on existing cards and
+  can still be left.
+- `blocked` still requires `blocker`, `done` still requires a recorded result.
+- A stage with `human_gate: true` (default: `merged`, `deployed`) only accepts
+  the human board owner. Agents must stop and ask; this is not a hint.
+- Entering a stage with `counts_round: true` (`changes_requested`) spends one
+  round. When the next round would exceed the budget the card is fused into the
+  workflow's fuse stage and the reason is written into `blocker`; the response
+  carries `transition.fused` and `transition.reason`.
+
+### Stage and status must agree
+
+`stage` is the precise state and `status` is its coarse family (`active` stages
+are `planned`/`in_progress`, `halted` is `blocked`, `terminal` is `done`). The
+server keeps them consistent on every save:
+
+- creating a card on a stage stores that stage's coarse status, and creating one
+  with only a `status` picks the matching stage;
+- a status-only `PATCH` (the pre-existing entry point) also moves the stage to
+  that status' stage, so a card never stays on `working` while claiming
+  `blocked`. Once a card is on a stage, that move follows the same rules as the
+  `stage` field — `409 invalid_transition` with the allowed next stages, `403
+  human_gate_required` for a gated target, `409 stage_deprecated` for a
+  deprecated one — so neither field is a side door past the graph. A refused
+  move changes nothing and writes no event. Cards created before this feature
+  have no stage, so their status stays a plain content edit until they move
+  once;
+- a `PATCH` that sends both fields is accepted only when the status is the one
+  that stage carries; otherwise it answers `409 status_stage_conflict` instead
+  of storing a card whose two views disagree;
+- both entry points write the same transition event, reporting the round budget
+  the edit leaves in force. An edit that leaves the stage where it is writes
+  none.
+
+### The fuse stage
+
+Every resolved workflow must keep one halted stage that agents may enter: the
+first non-deprecated `category: "halted"` stage with `human_gate: false`. It is
+where the round fuse lands, so `PUT /api/workflow` rejects a definition that
+removes it or puts it behind a human gate. Marking the only halted stage
+`human_gate: true` would leave the fuse nowhere to stop.
+
+Leaving a halted stage is a recovery, not new rework: it spends no round and is
+never fused straight back, so `blocked → archived` completes normally.
+
+### Budget precedence
+
+`max_rounds` resolves card → project → global. Set it on one card for an
+unusually long review, on a project for a stricter process, or globally for the
+whole board. Empty means inherit.
+
+A `max_rounds` sent in the same `PATCH` as the stage move is the budget used for
+that move, including an explicit clear (`""`), which falls back to the workflow
+budget rather than to the card's previous value.
+
+### Events for automation
+
+Every accepted stage change appends one event, keyed by `(card_id, revision)`
+with a monotonic `seq`:
+
+`GET /api/workflow/events?after=<seq>&limit=100&card_id=<id>`
+
+Each event carries `event_id`, `card_id`, `work_key`, `project`, `revision`,
+`from_stage`, `to_stage`, `category`, `round`, `max_rounds`, `actor`,
+`implementer`, `reviewer`, `tester`, `pr_url`, `head_sha`, `last_verdict`,
+`test_env`, `next_step`, plus `requested_stage`, `reason` and `fused` when the
+round fuse fired, and `entry: "status"` when a status-only edit moved the stage.
+Replaying an idempotent write never produces a second event.
+
+The feed keeps the newest 5000 events. Every response carries `oldest_seq`. A
+cursor older than the retained window is answered with a `gap` block
+(`after`, `until`, `skipped`) plus a `resync` instruction instead of a silent
+hole: read `GET /api/board` for current state, then continue from
+`next_cursor`. The skipped transitions cannot be replayed.
+
+### Changing the definition
+
+Only the human owner may edit it:
+
+```json
+PUT /api/workflow
+{"expected_version": 3, "max_rounds": 4}
+PUT /api/workflow
+{"expected_version": 4, "project": "Hashi", "max_rounds": 2}
+PUT /api/workflow
+{"expected_version": 5, "stages": [ ...full stage list... ]}
+```
+
+`expected_version` is optimistic locking: a stale value returns
+`409 workflow_conflict` with the current definition. `reset: true` drops a
+project override, or restores the built-in template when no project is given.
+Stages are validated as a graph: unique keys, known `allowed_next` targets,
+category-consistent status values, and a halted fuse stage agents may enter.
+
+A project override is edited field by field. Sending only `max_rounds` keeps
+that project's own `stages` and `initial`; send `""` for a field to drop it and
+inherit the global value. A definition that would strand an existing live card —
+its stage disappears, or a non-terminal stage loses every next stage — is
+rejected with `409 workflow_strands_cards` naming the cards, so an edit cannot
+leave a card that can never move again.
+
+### Legacy cards
+
+Cards created before this feature carry no `stage`. Their stage is derived from
+`status` (`planned→initiated`, `in_progress→working`, `blocked→blocked`,
+`done→completed`) and nothing is written until someone actually moves them.
+
 ## CLI
 
 ```text
