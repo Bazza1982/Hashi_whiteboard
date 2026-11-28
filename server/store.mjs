@@ -1111,14 +1111,24 @@ export class BoardStore {
     const storedStage = card.stage || "";
     const index = stageIndex(workflow.stages);
     let plan = null;
-    // A card that never used the feature has no stored stage: its coarse status
-    // stays an ordinary content edit and the stage keeps being derived on read.
-    // Once a card is on a stage, every way of moving it — the stage field, the
-    // legacy coarse status field, or both in one edit — travels the same
-    // validated transition, so no field can move a card the graph forbids.
-    if (card.kind === "work" && storedStage) {
+    // Where the card stands. A card that predates the feature has no stored
+    // stage, so it stands on whatever its coarse status resolves to — the same
+    // stage a reader sees. That is the "from" its first explicit pick must be
+    // judged against; using an empty "from" would let that pick skip the graph,
+    // the human gate and the event.
+    const fromStage =
+      storedStage || defaultStageForStatus(workflow.stages, card.status);
+    // A card that never used the feature keeps its coarse status as an ordinary
+    // content edit and its stage derived on read; once it names a stage, every
+    // way of moving it — the stage field, the legacy coarse status field, or
+    // both in one edit — travels the same validated transition, so no field can
+    // move a card the graph forbids.
+    if (card.kind === "work") {
       const sendsStage = changes.stage !== undefined;
       const sendsStatus = changes.status !== undefined;
+      // The detail panel offers an empty stage as "follow the work status", so
+      // only a named stage is a deliberate pick; an empty one is resolved from
+      // the coarse status exactly like a status edit.
       const explicit = sendsStage ? String(changes.stage ?? "").trim() : "";
       const wantedStatus = sendsStatus
         ? String(changes.status ?? "").trim()
@@ -1126,7 +1136,7 @@ export class BoardStore {
       // A coarse status that really changed asks for the stage carrying it; an
       // unchanged one asks for no move at all.
       const derived =
-        !sendsStage && wantedStatus && wantedStatus !== card.status
+        !explicit && wantedStatus && wantedStatus !== card.status
           ? defaultStageForStatus(workflow.stages, wantedStatus)
           : "";
       const requested = explicit || derived;
@@ -1145,18 +1155,23 @@ export class BoardStore {
             requested_status: wantedStatus,
           },
         );
-      if (requested && requested !== storedStage) {
+      // A legacy card only moves when it names a stage; a coarse-status-only
+      // edit stays the old content edit it always was.
+      const moves = storedStage
+        ? Boolean(requested) && requested !== fromStage
+        : Boolean(explicit) && explicit !== fromStage;
+      if (moves) {
         plan = this.planTransition({
           actor,
           card,
           workflow,
-          from: storedStage,
+          from: fromStage,
           to: requested,
           changes,
         });
         // Which field moved the card is recorded on the event; the rules, the
         // round budget in force and the fuse are the same either way.
-        if (!sendsStage) plan.entry = "status";
+        if (!explicit) plan.entry = "status";
         changes.stage = plan.stage;
         changes.status = plan.status;
         if (plan.blocker !== undefined) changes.blocker = plan.blocker;

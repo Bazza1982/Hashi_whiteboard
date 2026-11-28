@@ -1136,3 +1136,111 @@ test("the event reports the budget this edit leaves in force", async (t) => {
     "a consumer must not read the stale budget from the event",
   );
 });
+
+test("a legacy card's first stage pick walks the graph and records the move", async (t) => {
+  const f = await fixture();
+  t.after(() => f.close());
+  const agent = await f.addActor("legacy first pick");
+  const id = randomUUID();
+  // A row written before the feature: coarse status only, edited by an agent.
+  f.store.save("card", {
+    kind: "work",
+    work_key: "workflow/legacy-first-pick",
+    title: "旧卡首次选阶段",
+    body: "old body",
+    project: "acceptance",
+    status: "in_progress",
+    next_step: "",
+    blocker: "",
+    repository: "",
+    branch: "",
+    instance: "",
+    pr_url: "",
+    merge_status: "not_opened",
+    asset_id: "",
+    announcement: false,
+    id,
+    owner_id: agent.actor.id,
+    created_by: "human-owner",
+    revision: 1,
+    layout_revision: 1,
+    position: { x: 0, y: 0 },
+    created_at: new Date().toISOString(),
+    updated_at: new Date().toISOString(),
+    updated_by: "human-owner",
+    archived_at: null,
+  });
+
+  // A coarse-status-only edit is still an ordinary content edit.
+  const content = await patch(f, id, agent.token, { title: "只改内容" });
+  assert.equal(content.status, 200, JSON.stringify(content.body));
+  assert.equal(f.store.get(id).stage, undefined);
+
+  // The first explicit pick must not skip the graph into a gated stage.
+  const gated = await patch(f, id, agent.token, { stage: "merged" });
+  assert.equal(gated.status, 409, JSON.stringify(gated.body));
+  assert.equal(gated.body.error.code, "invalid_transition");
+  assert.equal(f.store.get(id).stage, undefined);
+  assert.equal(
+    (await f.call(`/api/workflow/events?card_id=${id}`)).body.events.length,
+    0,
+    "a refused first pick must not leave a transition event behind",
+  );
+
+  // A legal first move is judged from the stage its coarse status resolves to,
+  // and leaves the same event a card with a stored stage would.
+  const moved = await patch(f, id, agent.token, { stage: "in_review" });
+  assert.equal(moved.status, 200, JSON.stringify(moved.body));
+  assert.equal(moved.body.card.stage, "in_review");
+  assert.equal(f.store.get(id).stage, "in_review");
+  let events = (await f.call(`/api/workflow/events?card_id=${id}`)).body.events;
+  assert.equal(events.length, 1, "the first move must be observable to HAL");
+  assert.equal(events[0].from_stage, "working");
+  assert.equal(events[0].to_stage, "in_review");
+
+  // And the human gate still stops the agent on that same card.
+  assert.equal((await patch(f, id, agent.token, { stage: "approved" })).status, 200);
+  const gate = await patch(f, id, agent.token, { stage: "merged" });
+  assert.equal(gate.status, 403, JSON.stringify(gate.body));
+  assert.equal(gate.body.error.code, "human_gate_required");
+  events = (await f.call(`/api/workflow/events?card_id=${id}`)).body.events;
+  assert.equal(events.at(-1).to_stage, "approved");
+});
+
+test("an empty stage follows the work status instead of skipping the check", async (t) => {
+  const f = await fixture();
+  t.after(() => f.close());
+  const created = await createWork(f, "workflow/auto-stage", {
+    stage: "working",
+  });
+  const id = created.body.card.id;
+
+  // The detail panel's "（按工作状态自动）" sends an empty stage with the
+  // status; it must resolve to that status's stage and pass the same check.
+  const blocked = await patch(f, id, ADMIN, {
+    stage: "",
+    status: "blocked",
+    blocker: "waiting on review",
+  });
+  assert.equal(blocked.status, 200, JSON.stringify(blocked.body));
+  assert.equal(blocked.body.card.stage, "blocked");
+  assert.equal(blocked.body.card.status, "blocked");
+  assert.equal(blocked.body.card.blocker, "waiting on review");
+  assert.equal(blocked.body.transition.from_stage, "working");
+  assert.equal(blocked.body.transition.entry, "status");
+
+  const events = (await f.call(`/api/workflow/events?card_id=${id}`)).body
+    .events;
+  assert.equal(events.length, 1);
+  assert.equal(events[0].to_stage, "blocked");
+
+  // Picking "auto" without changing the status asks for no move at all.
+  const still = await patch(f, id, ADMIN, { stage: "" });
+  assert.equal(still.status, 200, JSON.stringify(still.body));
+  assert.equal(still.body.card.stage, "blocked");
+  assert.equal(still.body.transition, undefined);
+  assert.equal(
+    (await f.call(`/api/workflow/events?card_id=${id}`)).body.events.length,
+    1,
+  );
+});
