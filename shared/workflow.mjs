@@ -502,8 +502,13 @@ export function stageCarryingStatus(
     ? stages
     : stages.filter((stage) => !stage.deprecated);
   const preferred = CANONICAL_STAGE[status];
+  // The canonical key only counts when it really carries this status: a
+  // definition may have moved that stage onto another one, and matching by key
+  // alone would land the caller on it and record the wrong status.
   const canonical = preferred
-    ? usable.find((stage) => stage.key === preferred)
+    ? usable.find(
+        (stage) => stage.key === preferred && stage.status === status,
+      )
     : null;
   return canonical || usable.find((stage) => stage.status === status) || null;
 }

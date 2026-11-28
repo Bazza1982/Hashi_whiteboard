@@ -1497,6 +1497,26 @@ test("a flexible status-only edit keeps the requested status instead of substitu
   );
   assert.equal(unborn.status, 409, JSON.stringify(unborn.body));
   assert.equal(unborn.body.error.code, "status_stage_unavailable");
+
+  // A definition may leave the canonical stage carrying another status. The
+  // canonical key then only matches by name, so it must not win: the card has
+  // to land on a stage that truly carries the requested status, not store the
+  // canonical stage's different one.
+  const current = (await f.call("/api/workflow")).body.workflow;
+  const shifted = current.stages.map((s) =>
+    s.key === "working" ? { ...s, status: "planned" } : s,
+  );
+  const shiftedPut = await f.call("/api/workflow", {
+    method: "PUT",
+    body: { expected_version: current.version, stages: shifted },
+  });
+  assert.equal(shiftedPut.status, 200, JSON.stringify(shiftedPut.body));
+
+  assert.equal((await patch(f, id, token, { stage: "initiated" })).status, 200);
+  const carried = await patch(f, id, token, { status: "in_progress" });
+  assert.equal(carried.status, 200, JSON.stringify(carried.body));
+  assert.equal(carried.body.card.status, "in_progress");
+  assert.equal(carried.body.card.stage, "claimed");
 });
 
 test("only the human owner switches mode and a flexible definition needs no fuse stage", async (t) => {
