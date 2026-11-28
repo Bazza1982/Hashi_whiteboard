@@ -1109,10 +1109,43 @@ export class BoardStore {
     const changes = { ...data.changes };
     const workflow = this.workflow(String(changes.project ?? card.project));
     const storedStage = card.stage || "";
+    const index = stageIndex(workflow.stages);
     let plan = null;
-    if (card.kind === "work" && changes.stage !== undefined) {
-      const requested = String(changes.stage).trim();
-      if (requested && requested !== storedStage)
+    // A card that never used the feature has no stored stage: its coarse status
+    // stays an ordinary content edit and the stage keeps being derived on read.
+    // Once a card is on a stage, every way of moving it — the stage field, the
+    // legacy coarse status field, or both in one edit — travels the same
+    // validated transition, so no field can move a card the graph forbids.
+    if (card.kind === "work" && storedStage) {
+      const sendsStage = changes.stage !== undefined;
+      const sendsStatus = changes.status !== undefined;
+      const explicit = sendsStage ? String(changes.stage ?? "").trim() : "";
+      const wantedStatus = sendsStatus
+        ? String(changes.status ?? "").trim()
+        : "";
+      // A coarse status that really changed asks for the stage carrying it; an
+      // unchanged one asks for no move at all.
+      const derived =
+        !sendsStage && wantedStatus && wantedStatus !== card.status
+          ? defaultStageForStatus(workflow.stages, wantedStatus)
+          : "";
+      const requested = explicit || derived;
+      const target = requested ? index.get(requested) : null;
+      // A stage and a status sent together must agree. Applying half of the
+      // pair would store a card whose stage and status contradict each other.
+      if (explicit && wantedStatus && target)
+        fail(
+          wantedStatus === target.status,
+          "status_stage_conflict",
+          `Stage "${target.key}" carries status "${target.status}", but this edit also asks for "${wantedStatus}". Send the stage alone to move the card, or send the status alone so it can pick the stage.`,
+          409,
+          {
+            stage: target.key,
+            status: target.status,
+            requested_status: wantedStatus,
+          },
+        );
+      if (requested && requested !== storedStage) {
         plan = this.planTransition({
           actor,
           card,
@@ -1121,53 +1154,12 @@ export class BoardStore {
           to: requested,
           changes,
         });
-      if (plan) {
+        // Which field moved the card is recorded on the event; the rules, the
+        // round budget in force and the fuse are the same either way.
+        if (!sendsStage) plan.entry = "status";
         changes.stage = plan.stage;
         changes.status = plan.status;
         if (plan.blocker !== undefined) changes.blocker = plan.blocker;
-      }
-    }
-    // The original status entry point stays supported, but it must not leave a
-    // stored stage that contradicts the coarse status: a status-only edit also
-    // moves the stage and records the same transition event.
-    let statusPlan = null;
-    if (
-      card.kind === "work" &&
-      !plan &&
-      changes.stage === undefined &&
-      changes.status !== undefined
-    ) {
-      const wanted = String(changes.status).trim();
-      if (wanted && wanted !== card.status && storedStage) {
-        const index = stageIndex(workflow.stages);
-        const derived = defaultStageForStatus(workflow.stages, wanted);
-        const target = index.get(derived);
-        if (target && derived !== storedStage) {
-          // The legacy entry point keeps its coarse jump — old clients only
-          // send status — but it grants no permission: a deprecated stage or a
-          // stage that needs a human decision is refused here exactly as it is
-          // on the stage field, so it cannot be used to slip past a gate.
-          this.requireEnterable(actor, target);
-          changes.stage = derived;
-          changes.status = target.status;
-          statusPlan = {
-            from: storedStage,
-            requested: derived,
-            stage: target.key,
-            status: target.status,
-            category: target.category,
-            round:
-              Number.isSafeInteger(card.round) && card.round >= 1
-                ? card.round
-                : 1,
-            max_rounds: this.effectiveMaxRounds(card, workflow),
-            reason: "",
-            counts_round: false,
-            human_gate: Boolean(target.human_gate),
-            fused: false,
-            entry: "status",
-          };
-        }
       }
     }
     const content = withoutEmptyWorkflowFields(
@@ -1208,7 +1200,7 @@ export class BoardStore {
       revision: card.revision + 1,
     });
     this.save("card", next);
-    const chosen = plan || statusPlan;
+    const chosen = plan;
     // One event per real stage move; an edit that leaves the stage in place
     // (a fused card asked to re-enter its own stage) records nothing.
     const moved =

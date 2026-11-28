@@ -162,6 +162,7 @@ test("only allowed transitions pass and the rejection names the allowed next sta
   assert.equal(illegal.body.error.code, "invalid_transition");
   assert.deepEqual(illegal.body.error.allowed_next, [
     "claimed",
+    "working",
     "blocked",
     "archived",
   ]);
@@ -1023,5 +1024,115 @@ test("a card carries its own budget apart from the inherited one", async (t) => 
     ownCard.body.card.max_rounds,
     5,
     "an override outlives the project budget",
+  );
+});
+test("a coarse status cannot jump the stage graph", async (t) => {
+  const f = await fixture();
+  t.after(() => f.close());
+  const created = await createWork(f, "workflow/status-graph", {
+    body: "x",
+  });
+  const id = created.body.card.id;
+  assert.equal(created.body.card.stage, "initiated");
+
+  // initiated cannot reach completed in one hop, whichever field asks for it.
+  const byStage = await patch(f, id, ADMIN, { stage: "completed" });
+  assert.equal(byStage.status, 409);
+  assert.equal(byStage.body.error.code, "invalid_transition");
+
+  const byStatus = await patch(f, id, ADMIN, { status: "done" });
+  assert.equal(byStatus.status, 409, JSON.stringify(byStatus.body));
+  assert.equal(byStatus.body.error.code, "invalid_transition");
+  assert.deepEqual(byStatus.body.error.allowed_next, [
+    "claimed",
+    "working",
+    "blocked",
+    "archived",
+  ]);
+
+  const untouched = await f.call(`/api/cards/${id}`);
+  assert.equal(untouched.body.card.stage, "initiated");
+  assert.equal(untouched.body.card.status, "planned");
+  const after = (await f.call("/api/workflow/events?after=0")).body.events;
+  assert.equal(
+    after.filter((e) => e.card_id === id).length,
+    0,
+    "a refused move must not leave an event",
+  );
+
+  // The same status walks in as soon as the graph allows the hop.
+  for (const stage of ["claimed", "working", "in_review", "approved"]) {
+    const step = await patch(f, id, ADMIN, { stage });
+    assert.equal(step.status, 200, `${stage}: ${JSON.stringify(step.body)}`);
+  }
+  const done = await patch(f, id, ADMIN, {
+    status: "done",
+    body: "finished",
+  });
+  assert.equal(done.status, 200, JSON.stringify(done.body));
+  assert.equal(done.body.card.stage, "completed");
+  assert.equal(done.body.card.status, "done");
+  assert.equal(done.body.transition.entry, "status");
+});
+
+test("a stage and a status sent in one edit must agree", async (t) => {
+  const f = await fixture();
+  t.after(() => f.close());
+  const created = await createWork(f, "workflow/both-fields", {
+    stage: "working",
+  });
+  const id = created.body.card.id;
+  assert.equal(created.body.card.status, "in_progress");
+
+  const conflict = await patch(f, id, ADMIN, {
+    stage: "working",
+    status: "blocked",
+    blocker: "operator away",
+  });
+  assert.equal(conflict.status, 409, JSON.stringify(conflict.body));
+  assert.equal(conflict.body.error.code, "status_stage_conflict");
+  const kept = await f.call(`/api/cards/${id}`);
+  assert.equal(kept.body.card.stage, "working");
+  assert.equal(kept.body.card.status, "in_progress");
+  assert.equal(kept.body.card.blocker, "");
+
+  const agreed = await patch(f, id, ADMIN, {
+    stage: "blocked",
+    status: "blocked",
+    blocker: "operator away",
+  });
+  assert.equal(agreed.status, 200, JSON.stringify(agreed.body));
+  assert.equal(agreed.body.card.stage, "blocked");
+  assert.equal(agreed.body.card.status, "blocked");
+});
+
+test("the event reports the budget this edit leaves in force", async (t) => {
+  const f = await fixture();
+  t.after(() => f.close());
+  const created = await createWork(f, "workflow/budget-event", {
+    stage: "working",
+    max_rounds: 2,
+  });
+  const id = created.body.card.id;
+  assert.equal(created.body.card.max_rounds, 2);
+
+  const moved = await patch(f, id, ADMIN, {
+    status: "blocked",
+    blocker: "waiting",
+    max_rounds: 7,
+  });
+  assert.equal(moved.status, 200, JSON.stringify(moved.body));
+  assert.equal(moved.body.card.max_rounds, 7);
+  assert.equal(moved.body.transition.max_rounds, 7);
+  assert.equal(moved.body.transition.entry, "status");
+
+  const events = (await f.call(`/api/workflow/events?card_id=${id}`)).body
+    .events;
+  const last = events.at(-1);
+  assert.equal(last.to_stage, "blocked");
+  assert.equal(
+    last.max_rounds,
+    7,
+    "a consumer must not read the stale budget from the event",
   );
 });

@@ -100,6 +100,8 @@ const messages = {
   invalid_transition:
     "这张卡不能直接进入该阶段。请按规定的下一个阶段推进，或先调整工作流定义。",
   stage_deprecated: "该阶段已弃用，不能再进入。",
+  status_stage_conflict:
+    "阶段与工作状态对不上：请只改阶段（状态会自动跟随），或只改工作状态（由它挑阶段）。",
   human_gate_required: "这个阶段需要人类在白板上放行，Agent 不能自行推进。",
   invalid_max_rounds: "轮次上限请填 1–50 的整数，留空表示继承。",
   invalid_head_sha: "请填写 7–64 位的提交 SHA。",

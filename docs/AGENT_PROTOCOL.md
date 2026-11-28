@@ -196,11 +196,19 @@ server keeps them consistent on every save:
   with only a `status` picks the matching stage;
 - a status-only `PATCH` (the pre-existing entry point) also moves the stage to
   that status' stage, so a card never stays on `working` while claiming
-  `blocked`. It keeps its coarse jump for old clients but grants no permission:
-  a `human_gate` target answers `403 human_gate_required` and a deprecated one
-  `409 stage_deprecated`, exactly like the `stage` field;
-- both entry points write the same transition event. An edit that leaves the
-  stage where it is writes none.
+  `blocked`. Once a card is on a stage, that move follows the same rules as the
+  `stage` field — `409 invalid_transition` with the allowed next stages, `403
+  human_gate_required` for a gated target, `409 stage_deprecated` for a
+  deprecated one — so neither field is a side door past the graph. A refused
+  move changes nothing and writes no event. Cards created before this feature
+  have no stage, so their status stays a plain content edit until they move
+  once;
+- a `PATCH` that sends both fields is accepted only when the status is the one
+  that stage carries; otherwise it answers `409 status_stage_conflict` instead
+  of storing a card whose two views disagree;
+- both entry points write the same transition event, reporting the round budget
+  the edit leaves in force. An edit that leaves the stage where it is writes
+  none.
 
 ### The fuse stage
 

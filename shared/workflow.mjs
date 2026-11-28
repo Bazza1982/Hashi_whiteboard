@@ -21,7 +21,11 @@ export const DEFAULT_STAGES = [
     label_en: "Initiated",
     category: "active",
     status: "planned",
-    allowed_next: ["claimed", "blocked", "archived"],
+    // A card is often created for work that is already under way, and the
+    // coarse 工作状态 select writes the status without naming a stage, so a
+    // fresh card must be able to reach "working" in one step. Everything else
+    // still has to walk the graph.
+    allowed_next: ["claimed", "working", "blocked", "archived"],
     human_gate: false,
     counts_round: false,
     deprecated: false,

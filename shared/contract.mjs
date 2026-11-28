@@ -312,7 +312,7 @@ export const GUIDE = {
     project_edits:
       "A project override is edited field by field: PUT /api/workflow with only max_rounds keeps the project's own stages and initial. A definition that would strand an existing live card (its stage disappears, or a non-terminal stage loses every next stage) is rejected with workflow_strands_cards.",
     status_entry:
-      "stage is the precise state; status is its coarse family. Creating a card on a stage sets the matching status, and a status-only PATCH moves the card to that status' stage, so a saved card never shows a stage and a status that contradict each other. Both entry points record the same transition event.",
+      "stage is the precise state; status is its coarse family. Creating a card on a stage sets the matching status. Once a card is on a stage, a status-only PATCH moves it to the stage carrying that status under the same rules as the stage field: allowed_next, deprecated stages, human gates and the round fuse all apply, and a refused move changes nothing. Sending stage and status in one PATCH is only accepted when the status is the one that stage carries; otherwise the edit is refused with status_stage_conflict. Cards created before this feature have no stage, so their status stays a plain content edit until they are moved once.",
     events:
       "Every accepted stage move appends one event keyed by (card_id, revision) with a monotonic seq: a stage change through PATCH stage, a status-only edit that moves the stage, or an automatic fuse. An edit that leaves the stage in place records nothing. Poll GET /api/workflow/events?after=<seq> for stable consumption; replays of the same revision never duplicate an event.",
     event_retention:
